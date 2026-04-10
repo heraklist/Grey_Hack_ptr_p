@@ -1,0 +1,99 @@
+// CRS main entrypoint
+// Default deploy root: /home/z3r0/crs
+// If you deploy elsewhere, update the three import paths below to that absolute in-game folder.
+
+import_code("/home/z3r0/crs/crs_core.src")
+import_code("/home/z3r0/crs/crs_post.src")
+import_code("/home/z3r0/crs/crs_attack.src")
+
+runConfig = buildRunConfig()
+runtimeContext = buildRuntimeContext(runConfig.lib_dir)
+runConfig = promptForMissingInputs(runConfig)
+runConfig = resolveGhostConfig(runConfig, runtimeContext)
+targetContext = buildTargetContext(runConfig, runtimeContext)
+runConfig.mode = resolveMode(runConfig, targetContext)
+outputFiles = prepareOutputFiles(runtimeContext, runConfig)
+if outputFiles == null then exit("Unable to prepare output files")
+
+runState = buildInitialRunState(runtimeContext, runConfig, targetContext, outputFiles)
+printStartupSummary(runtimeContext, runConfig, targetContext, outputFiles)
+startupReportResult = writeStartupReport(runtimeContext, runConfig, targetContext, outputFiles)
+if startupReportResult != 1 then exit("Unable to write startup report: " + normalizeInput(startupReportResult))
+
+discoveredHosts = discoverTargets(targetContext, runtimeContext, runState)
+rankedHosts = rankTargets(discoveredHosts, targetContext, runState)
+selectedHostIp = promptTargetHostMenu(rankedHosts, targetContext, runConfig, runState)
+if selectedHostIp == "" and rankedHosts != null and rankedHosts.len > 0 then selectedHostIp = rankedHosts[0].ip
+runState.selected_host_ip = selectedHostIp
+selectedHostRecord = findHostRecordByIp(rankedHosts, selectedHostIp)
+runState.selected_host_record = selectedHostRecord
+
+saveHostCacheResult = saveHostCache(outputFiles.host_cache_file, rankedHosts)
+if isError(saveHostCacheResult) then exit("Unable to save host cache: " + saveHostCacheResult)
+
+printDiscoverySummary(rankedHosts, selectedHostIp)
+
+attackResult = attackRankedTargets(rankedHosts, selectedHostRecord, runtimeContext, runState)
+runState.attack_result = attackResult
+
+credentialResult = null
+if runConfig.skip_credential_reuse then
+  credentialResult = {
+    "status": "disabled",
+    "shell": null,
+    "host_ip": "",
+    "user": "",
+    "source_host": "",
+    "attempts": 0,
+    "successes": 0,
+    "scanned_files": 0,
+    "password_candidates": 0,
+    "loot_records": 0,
+    "notes": ["Credential reuse skipped by configuration."],
+  }
+else if shouldDeferCredentialReuseToRouterHandoff(runState) then
+  credentialResult = {
+    "status": "deferred-router-handoff",
+    "shell": null,
+    "host_ip": "",
+    "user": "",
+    "source_host": "",
+    "attempts": 0,
+    "successes": 0,
+    "scanned_files": 0,
+    "password_candidates": 0,
+    "loot_records": 0,
+    "notes": ["Credential reuse deferred until router handoff completes."],
+  }
+else
+  credentialResult = attemptCredentialReuse(runtimeContext, runState, attackResult)
+end if
+runState.credential_result = credentialResult
+printCredentialSummary(credentialResult)
+
+finalResult = finalizeAcceptedAccess(runState)
+printFinalSummary(finalResult)
+
+saveSignatureCacheResult = saveSignatureCache(outputFiles.signature_cache_file, runState.signature_cache)
+if isError(saveSignatureCacheResult) then exit("Unable to save signature cache: " + saveSignatureCacheResult)
+
+saveCredentialCacheResult = saveCredentialCache(outputFiles.credential_cache_file, runState.credential_cache)
+if isError(saveCredentialCacheResult) then exit("Unable to save credential cache: " + saveCredentialCacheResult)
+
+saveSurfaceCacheResult = saveSurfaceCache(outputFiles.surface_cache_file, runState)
+if isError(saveSurfaceCacheResult) then exit("Unable to save surface cache: " + saveSurfaceCacheResult)
+
+saveLootCacheResult = saveLootCache(outputFiles.loot_cache_file, runState)
+if isError(saveLootCacheResult) then exit("Unable to save loot cache: " + saveLootCacheResult)
+
+discoveryReportResult = writeDiscoveryReport(runtimeContext, runConfig, targetContext, outputFiles, discoveredHosts, rankedHosts, selectedHostIp, attackResult, credentialResult, finalResult)
+if isError(discoveryReportResult) then exit("Unable to write discovery report: " + discoveryReportResult)
+
+sessionReportResult = appendSessionReport(outputFiles)
+if isError(sessionReportResult) then print("Warning: unable to append session report: " + sessionReportResult)
+
+workerManifestResult = writeWorkerManifest(outputFiles, runtimeContext, runState, finalResult)
+if isError(workerManifestResult) then print("Warning: unable to write worker manifest: " + workerManifestResult)
+
+print("CRS V1 run complete.")
+print("Reports and caches updated.")

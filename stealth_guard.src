@@ -1,0 +1,751 @@
+// ============================================================
+//   GREY HACK — STEALTH GUARD v2.0
+//   Admin Watch | Trace Clean | Multi-target | Dry-run | Report
+//
+// DEPENDENCIES:
+//   /lib/metaxploit.so
+//
+// BUILD:
+//   build /home/guest/stealth_guard.src /home/guest/
+// RUN:
+//   stealth_guard
+// ============================================================
+
+
+// ── LOCAL CONTEXT ─────────────────────────────────────────────
+
+local_shell = get_shell
+if not local_shell then
+    exit("[-] Local shell not found.")
+end if
+
+local_comp = local_shell.host_computer
+if not local_comp then
+    exit("[-] Local computer not found.")
+end if
+
+my_ip   = local_comp.public_ip
+my_user = active_user
+my_user_lower = my_user.lower
+
+
+// ── CONFIGURATION ─────────────────────────────────────────────
+
+WATCH_INTERVAL  = 15      // Seconds between checks in watch mode.
+REPORT_NAME     = "stealth_report.txt"
+REPORT_PATH     = home_dir + "/" + REPORT_NAME
+DRY_RUN         = false   // Set to true for preview mode with no changes.
+
+// Targets for multi-target cleanup (IP, user, pass, port).
+// Fill this before use or provide them interactively.
+SAVED_TARGETS   = []
+
+
+// ── REPORT BUFFER ─────────────────────────────────────────────
+
+report_lines = []
+
+log = function(tag, msg)
+    line = "[" + time + "] [" + tag + "] " + msg
+    print(line)
+    report_lines.push(line)
+end function
+
+div = function()
+    print("────────────────────────────────────────────────")
+end function
+
+normalize_spaces = function(text)
+    normalized = text
+    while normalized.contains("  ")
+        normalized = normalized.replace("  ", " ")
+    end while
+    return normalized.trim
+end function
+
+is_process_header = function(proc_line)
+    normalized = normalize_spaces(proc_line)
+    if normalized.len == 0 then
+        return true
+    end if
+
+    proc_lower = normalized.lower
+    if normalized.contains("---") then
+        return true
+    end if
+    if proc_lower.contains("user") and proc_lower.contains("pid") then
+        return true
+    end if
+    if proc_lower.contains("name") and proc_lower.contains("pid") then
+        return true
+    end if
+    return false
+end function
+
+parse_process_line = function(proc_line)
+    normalized = normalize_spaces(proc_line)
+    if is_process_header(normalized) then
+        return null
+    end if
+
+    parts = normalized.split(" ")
+    owner = ""
+    if parts.len > 0 then
+        owner = parts[0]
+    end if
+
+    pid = null
+    if parts.len > 1 then
+        pid_candidate = parts[1].to_int
+        if typeof(pid_candidate) == "number" then
+            pid = pid_candidate
+        end if
+    end if
+
+    proc_name = normalized
+    if parts.len > 0 then
+        proc_name = parts[parts.len - 1]
+    end if
+
+    return {"raw": normalized, "owner": owner, "pid": pid, "name": proc_name}
+end function
+
+line_has_user_trace = function(line)
+    if typeof(line) != "string" then
+        return false
+    end if
+
+    if my_user_lower == "" then
+        return false
+    end if
+
+    line_lower = line.lower
+    if line_lower.contains("/home/" + my_user_lower) then
+        return true
+    end if
+    if line_lower.contains("user=" + my_user_lower) then
+        return true
+    end if
+    if line_lower.contains("user:" + my_user_lower) then
+        return true
+    end if
+    if line_lower.contains("owner=" + my_user_lower) then
+        return true
+    end if
+    if line_lower.contains("owner:" + my_user_lower) then
+        return true
+    end if
+
+    padded = " " + line_lower + " "
+    if padded.contains(" " + my_user_lower + " ") then
+        return true
+    end if
+
+    return false
+end function
+
+line_has_trace = function(line)
+    if typeof(line) != "string" then
+        return false
+    end if
+
+    if my_ip != "" and line.contains(my_ip) then
+        return true
+    end if
+
+    return line_has_user_trace(line)
+end function
+
+collect_trace_lines = function(content)
+    matches = []
+    if typeof(content) != "string" then
+        return matches
+    end if
+
+    for line in content.split(char(10))
+        if line_has_trace(line) then
+            matches.push(line)
+        end if
+    end for
+
+    return matches
+end function
+
+strip_trace_lines = function(content)
+    result = {"content": "", "removed": 0}
+    if typeof(content) != "string" then
+        return result
+    end if
+
+    for line in content.split(char(10))
+        if line_has_trace(line) then
+            result["removed"] = result["removed"] + 1
+            continue
+        end if
+        result["content"] = result["content"] + line + char(10)
+    end for
+
+    return result
+end function
+
+clean_trace_file = function(f, label)
+    if not f then
+        return 0
+    end if
+    if f.is_binary or f.is_folder then
+        return 0
+    end if
+    if not f.has_permission("r") then
+        return 0
+    end if
+
+    content = f.get_content
+    if typeof(content) != "string" then
+        return 0
+    end if
+
+    matches = collect_trace_lines(content)
+    if matches.len == 0 then
+        return 0
+    end if
+
+    log("CLEAN", "[" + label + "] Trace found: " + f.path)
+
+    if DRY_RUN then
+        for line in matches
+            log("DRY", "[" + label + "] Would remove: " + line)
+        end for
+        return 1
+    end if
+
+    if not f.has_permission("w") then
+        log("CLEAN", "[" + label + "] No write permission: " + f.path)
+        return 0
+    end if
+
+    stripped = strip_trace_lines(content)
+    if stripped["removed"] == 0 then
+        return 0
+    end if
+
+    res = f.set_content(stripped["content"])
+    if typeof(res) == "string" and res != "" then
+        log("CLEAN", "[" + label + "] Write error: " + f.path + " -> " + res)
+        return 0
+    end if
+
+    log("CLEAN", "[" + label + "] OK: " + f.path + " (" + stripped["removed"] + " lines removed)")
+    return 1
+end function
+
+clean_trace_paths = function(target_comp, label, search_paths)
+    matched = 0
+
+    for folder_path in search_paths
+        folder = target_comp.File(folder_path)
+        if not folder then
+            continue
+        end if
+
+        if folder.is_folder then
+            files = folder.get_files
+        else
+            files = [folder]
+        end if
+
+        if not files then
+            continue
+        end if
+
+        for f in files
+            matched = matched + clean_trace_file(f, label)
+        end for
+    end for
+
+    return matched
+end function
+
+save_report = function()
+    if report_lines.len == 0 then
+        return
+    end if
+
+    content = ""
+    for line in report_lines
+        content = content + line + char(10)
+    end for
+
+    f = local_comp.File(REPORT_PATH)
+    if not f then
+        created = local_comp.touch(home_dir, REPORT_NAME)
+        if not created then
+            log("REPORT", "Failed to create report file: " + REPORT_PATH)
+            return
+        end if
+        f = local_comp.File(REPORT_PATH)
+    end if
+
+    if not f then
+        log("REPORT", "Failed to access report file: " + REPORT_PATH)
+        return
+    end if
+
+    existing = ""
+    if f.has_permission("r") then
+        existing = f.get_content
+        if typeof(existing) != "string" then
+            existing = ""
+        end if
+    end if
+
+    if not f.has_permission("w") then
+        log("REPORT", "No write permission: " + REPORT_PATH)
+        return
+    end if
+
+    write_res = f.set_content(existing + content)
+    if typeof(write_res) == "string" and write_res != "" then
+        log("REPORT", "Failed to save report: " + write_res)
+        return
+    end if
+
+    log("REPORT", "Report saved: " + REPORT_PATH)
+end function
+
+normalize_port = function(port_value)
+    if typeof(port_value) == "string" then
+        port_value = port_value.trim.to_int
+    end if
+    if typeof(port_value) != "number" then
+        return null
+    end if
+    if port_value < 1 or port_value > 65535 then
+        return null
+    end if
+    return port_value
+end function
+
+connect_ssh = function(ip, user, pass, port, tag)
+    safe_port = normalize_port(port)
+    if not safe_port then
+        log(tag, "Invalid port for " + ip + ": " + port)
+        return null
+    end if
+
+    session = local_shell.connect_service(ip, safe_port, user, pass, "ssh")
+    if typeof(session) == "string" then
+        log(tag, "Connection failed for " + ip + ":" + safe_port + " -> " + session)
+        return null
+    end if
+
+    if not session then
+        log(tag, "Connection failed for " + ip + ":" + safe_port)
+        return null
+    end if
+
+    return session
+end function
+
+
+// ════════════════════════════════════════════════════════════
+//  MODULE 1 — ACTIVE SESSION CHECK (dsession + ping)
+// ════════════════════════════════════════════════════════════
+
+check_admin_online = function(target_comp, target_ip, expected_user = "")
+    // Ping check before anything else.
+    ping_result = local_shell.ping(target_ip)
+    if not ping_result then
+        log("GUARD", "Ping failed for " + target_ip + " — conservative mode: assume unsafe.")
+        return true
+    end if
+
+    procs = target_comp.show_procs
+    if typeof(procs) != "string" then
+        log("GUARD", "show_procs failed — conservative mode: assume unsafe.")
+        return true
+    end if
+
+    expected_user_lower = ""
+    if typeof(expected_user) == "string" then
+        expected_user_lower = expected_user.lower
+    end if
+    active_sessions = []
+
+    for proc_line in procs.split(char(10))
+        proc_info = parse_process_line(proc_line)
+        if not proc_info then
+            continue
+        end if
+
+        proc_name_lower = proc_info["name"].lower
+        proc_raw_lower = proc_info["raw"].lower
+
+        if proc_name_lower.contains("dsession") or proc_raw_lower.contains("dsession") then
+            active_sessions.push(proc_info)
+        end if
+    end for
+
+    if active_sessions.len == 0 then
+        log("GUARD", target_ip + " — CLEAR.")
+        return false
+    end if
+
+    for proc_info in active_sessions
+        owner = proc_info["owner"]
+        if owner == "" then
+            owner = "unknown"
+        end if
+
+        if expected_user_lower != "" and owner.lower == expected_user_lower then
+            log("WARN", "  [!] Active session detected for the connected account: " + proc_info["raw"])
+        else
+            log("WARN", "  [!] Active session detected for user " + owner + ": " + proc_info["raw"])
+        end if
+    end for
+
+    if active_sessions.len > 0 then
+        log("WARN", target_ip + " — ACTIVE SESSION DETECTED! Do not proceed.")
+    end if
+
+    return true
+end function
+
+
+// ════════════════════════════════════════════════════════════
+//  MODULE 2 — WATCH MODE (auto-loop)
+//  Runs continuously every WATCH_INTERVAL seconds.
+//  Warns you if an active session appears while you work.
+//  Stops with Ctrl+C or when an active session is detected.
+// ════════════════════════════════════════════════════════════
+
+watch_mode = function(target_comp, target_ip, expected_user = "")
+    div
+    log("WATCH", "Watch mode active — checking every " + WATCH_INTERVAL + "s.")
+    log("WATCH", "Stops automatically when an active session is detected.")
+    div
+
+    iteration = 0
+    while true
+        iteration = iteration + 1
+        log("WATCH", "Check #" + iteration + " (" + target_ip + ")")
+
+        admin_found = check_admin_online(target_comp, target_ip, expected_user)
+
+        if admin_found then
+            print("")
+            print("  ████████████████████████████████████")
+            print("  ██ ACTIVE SESSION - STOP NOW ██")
+            print("  ████████████████████████████████████")
+            print("")
+            log("WATCH", "Watch mode stopped due to active session detection.")
+            break
+        end if
+
+        log("WATCH", "Next check in " + WATCH_INTERVAL + " seconds...")
+        wait(WATCH_INTERVAL)
+    end while
+end function
+
+
+// ════════════════════════════════════════════════════════════
+//  MODULE 3 — LOG CLEANER (with dry-run)
+// ════════════════════════════════════════════════════════════
+
+clean_logs_for = function(target_comp, label)
+    div
+    if DRY_RUN then
+        log("DRY", "[" + label + "] DRY-RUN — no file will be changed.")
+    else
+        log("CLEAN", "[" + label + "] Cleaning transfer traces...")
+    end if
+
+    search_paths = ["/var/log", "/home/root", "/home/admin", "/home/guest"]
+    matched = clean_trace_paths(target_comp, label, search_paths)
+
+    if DRY_RUN then
+        log("DRY", "[" + label + "] Matched " + matched + " files.")
+    else
+        log("CLEAN", "[" + label + "] Cleaned " + matched + " files.")
+    end if
+end function
+
+
+// ════════════════════════════════════════════════════════════
+//  MODULE 4 — ROUTER CHECK
+// ════════════════════════════════════════════════════════════
+
+check_router = function(target_ip)
+    div
+    log("ROUTER", "Router check for " + target_ip + "...")
+
+    router = get_router(target_ip)
+    if not router then
+        log("ROUTER", "Router not found.")
+        return
+    end if
+
+    fw = router.firewall_rules
+    if typeof(fw) == "string" then
+        log("ROUTER", "Failed to read firewall rules: " + fw)
+        return
+    end if
+
+    if not fw or fw.len == 0 then
+        log("ROUTER", "No firewall rules found.")
+        return
+    end if
+
+    ip_found = false
+    for rule in fw
+        if rule.contains(my_ip) then
+            ip_found = true
+            break
+        end if
+    end for
+
+    if ip_found then
+        log("ROUTER", "[!] Your IP (" + my_ip + ") is present in the firewall rules!")
+        log("ROUTER", "    You may have been noticed.")
+    else
+        log("ROUTER", "IP not present in firewall rules — OK.")
+    end if
+end function
+
+
+// ════════════════════════════════════════════════════════════
+//  MODULE 5 — SELF CLEAN
+// ════════════════════════════════════════════════════════════
+
+clean_self = function()
+    div
+    if DRY_RUN then
+        log("DRY", "SELF CLEAN — dry-run, no file will be changed.")
+    end if
+
+    log("SELF", "Cleaning local logs...")
+
+    matched = clean_trace_paths(local_comp, "LOCAL", ["/var/log"])
+    if DRY_RUN then
+        log("DRY", "SELF CLEAN — matched " + matched + " files.")
+    else
+        log("SELF", "Local cleanup completed. Cleaned " + matched + " files.")
+    end if
+end function
+
+
+// ════════════════════════════════════════════════════════════
+//  MODULE 6 — MULTI-TARGET CLEANUP
+//  Repeats cleanup across multiple targets in sequence.
+//  Targets come either from SAVED_TARGETS or interactive input.
+// ════════════════════════════════════════════════════════════
+
+connect_target = function(ip, user, pass, port)
+    return connect_ssh(ip, user, pass, port, "MULTI")
+end function
+
+multi_target_cleanup = function(targets)
+    div
+    log("MULTI", "Multi-target cleanup — " + targets.len + " targets.")
+
+    for t in targets
+        ip   = t["ip"]
+        user = t["user"]
+        pass = t["pass"]
+        port = t["port"]
+
+        log("MULTI", "→ " + ip + " (" + user + ":" + port + ")")
+
+        // Ping first.
+        ping_ok = local_shell.ping(ip)
+        if not ping_ok then
+            log("MULTI", "  Ping failed — skipping.")
+            continue
+        end if
+
+        tc = connect_target(ip, user, pass, port)
+        if not tc then
+            continue
+        end if
+
+        target_comp = tc.host_computer
+        if not target_comp then
+            continue
+        end if
+
+        admin_present = check_admin_online(target_comp, ip, user)
+        if admin_present then
+            log("MULTI", "  Active session detected — skipping cleanup.")
+            continue
+        end if
+
+        clean_logs_for(target_comp, ip)
+        check_router(ip)
+        log("MULTI", "  Done: " + ip)
+    end for
+
+    log("MULTI", "Multi-target cleanup completed.")
+end function
+
+
+// ════════════════════════════════════════════════════════════
+//  MAIN MENU
+// ════════════════════════════════════════════════════════════
+
+print("")
+print("╔══════════════════════════════════════════════════╗")
+print("║         STEALTH GUARD v2.0                       ║")
+print("║  Watch | Clean | Multi-target | Dry-run | Report ║")
+print("╚══════════════════════════════════════════════════╝")
+print("  My IP:   " + my_ip)
+print("  My user: " + my_user)
+print("")
+
+// Dry-run toggle.
+dry = user_input("Enable dry-run mode (preview without changes)? (y/n): ")
+if dry == "y" then
+    DRY_RUN = true
+    log("DRY", "DRY-RUN enabled — no file will be modified.")
+end if
+
+print("")
+print("  Select mode:")
+print("  [1] Active-session check (single target)")
+print("  [2] Active-session watch mode (loop)")
+print("  [3] Cleanup single target")
+print("  [4] Cleanup multi-target")
+print("  [5] Self clean (local only)")
+print("  [6] Full sequence (check → clean → self)")
+print("")
+
+mode = user_input("Mode: ")
+
+// ── Helpers for interactive target input ──────────────────
+
+get_target_interactive = function()
+    ip   = user_input("Target IP: ")
+    if not is_valid_ip(ip) then
+        log("ERR", "Invalid IP address.")
+        return null
+    end if
+    user = user_input("Username: ")
+    pass = user_input("Password: ", true)
+    port_str = user_input("Port (press Enter for 22): ").trim
+    port = 22
+    if port_str.len > 0 then
+        port = normalize_port(port_str)
+        if not port then
+            log("ERR", "Invalid port.")
+            return null
+        end if
+    end if
+    return {"ip": ip, "user": user, "pass": pass, "port": port}
+end function
+
+connect_interactive = function(t)
+    if not t then
+        return null
+    end if
+    return connect_ssh(t["ip"], t["user"], t["pass"], t["port"], "ERR")
+end function
+
+
+// ── Mode execution ─────────────────────────────────────────
+
+if mode == "1" then
+    // Active-session check.
+    t = get_target_interactive
+    if t then
+        tc = connect_interactive(t)
+        if tc then
+            check_admin_online(tc.host_computer, t["ip"], t["user"])
+        end if
+    end if
+
+else if mode == "2" then
+    // Watch mode.
+    t = get_target_interactive
+    if t then
+        tc = connect_interactive(t)
+        if tc then
+            watch_mode(tc.host_computer, t["ip"], t["user"])
+        end if
+    end if
+
+else if mode == "3" then
+    // Single cleanup.
+    t = get_target_interactive
+    if t then
+        tc = connect_interactive(t)
+        if tc then
+            clean_logs_for(tc.host_computer, t["ip"])
+            check_router(t["ip"])
+        end if
+    end if
+
+else if mode == "4" then
+    // Multi-target.
+    targets = []
+    if SAVED_TARGETS.len > 0 then
+        use_saved = user_input("Use saved targets? (y/n): ")
+        if use_saved == "y" then
+            targets = SAVED_TARGETS
+        end if
+    end if
+
+    if targets.len == 0 then
+        count_str = user_input("How many targets? ")
+        count = count_str.to_int
+        if not count or count < 1 then
+            count = 1
+        end if
+        i = 0
+        while i < count
+            log("MULTI", "Target " + (i + 1) + ":")
+            t = get_target_interactive
+            if t then
+                targets.push(t)
+            end if
+            i = i + 1
+        end while
+    end if
+
+    multi_target_cleanup(targets)
+
+else if mode == "5" then
+    // Self clean.
+    clean_self
+
+else if mode == "6" then
+    // Full sequence.
+    t = get_target_interactive
+    if t then
+        tc = connect_interactive(t)
+        if tc then
+            admin_present = check_admin_online(tc.host_computer, t["ip"], t["user"])
+            if admin_present then
+                print("")
+                log("ABORT", "Active session detected — aborted.")
+            else
+                clean_logs_for(tc.host_computer, t["ip"])
+                check_router(t["ip"])
+                clean_self
+                log("DONE", "Full sequence completed.")
+            end if
+        end if
+    end if
+
+else
+    log("ERR", "Invalid mode.")
+end if
+
+
+// ── Save report ────────────────────────────────────────────
+
+save_rep = user_input("Save report? (y/n): ")
+if save_rep == "y" then
+    save_report
+end if
+
+div
+log("DONE", "Stealth Guard v2.0 — exit.")
+div

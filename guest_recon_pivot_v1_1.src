@@ -1,0 +1,388 @@
+// guest_recon_pivot_v1_1.src
+// modes: audit | pivot | loot | all
+// purpose: lean guest foothold recon / loot / pivot helper
+// no exploit logic
+
+shell = get_shell
+if not shell then exit("No active shell")
+
+computer = shell.host_computer
+if not computer then exit("No host computer")
+
+mode = "all"
+if params and params.len > 0 then mode = params[0].lower
+
+TAB = char(9)
+NL = char(10)
+CR = char(13)
+
+home = home_dir
+
+keywords = ["pass", "password", "passwd", "mail", "bank", "secret", "token", "key", "ssh", "ftp", "login", "user", "backup", "config", "todo"]
+audit_paths = [home, "/home", "/var", "/server", "/Public", "/boot", "/bin", "/usr/bin"]
+scan_roots = [home, home + "/crs", "/server", "/Public", "/boot"]
+
+globals.visited_dirs = []
+globals.local_users = []
+globals.service_loot = []
+globals.credential_cache = []
+globals.hit_count = 0
+globals.file_count = 0
+globals.dir_count = 0
+
+safe_preview = function(text, max_len=180)
+    if text == null then return ""
+    out = text.replace(CR, "")
+    out = out.replace(NL, " | ")
+    if out.len > max_len then out = out[:max_len] + "..."
+    return out
+end function
+
+find_keyword = function(text)
+    if text == null or text.len == 0 then return null
+    low = text.lower
+    for kw in keywords
+        if low.indexOf(kw) != null then return kw
+    end for
+    return null
+end function
+
+print_entry = function(f)
+    ftype = "FILE"
+    if f.is_folder then ftype = "DIR"
+    access = "r:" + f.has_permission("r") + " w:" + f.has_permission("w") + " x:" + f.has_permission("x")
+    print("  [" + ftype + "] " + f.name + " | " + f.permissions + " | " + f.owner + ":" + f.group + " | " + access + " | " + f.size + "b")
+end function
+
+inspect_path = function(path)
+    f = computer.File(path)
+
+    print("")
+    print("== " + path + " ==")
+
+    if not f then
+        print("Missing / not found")
+        return
+    end if
+
+    if f.is_folder then
+        print("Type: folder")
+    else
+        print("Type: file")
+    end if
+
+    print("Perms: " + f.permissions)
+    print("Owner: " + f.owner + ":" + f.group)
+    print("Access: r=" + f.has_permission("r") + " w=" + f.has_permission("w") + " x=" + f.has_permission("x"))
+
+    if f.is_folder then
+        if not f.has_permission("r") then
+            print("No read permission for directory listing")
+            return
+        end if
+
+        items = f.get_folders + f.get_files
+        if items.len == 0 then
+            print("(empty)")
+            return
+        end if
+
+        shown = 0
+        for item in items
+            print_entry(item)
+            shown = shown + 1
+            if shown >= 15 then
+                print("  ... truncated ...")
+                break
+            end if
+        end for
+
+    else
+        if f.is_binary then
+            print("Binary file")
+            return
+        end if
+
+        if not f.has_permission("r") then
+            print("No read permission for file content")
+            return
+        end if
+
+        print("Preview:")
+        print(safe_preview(f.get_content, 220))
+    end if
+end function
+
+collect_local_users = function()
+    globals.local_users = []
+
+    home_root = computer.File("/home")
+    if not home_root then return
+    if not home_root.is_folder then return
+    if not home_root.has_permission("r") then return
+
+    for dir in home_root.get_folders
+        entry = {}
+        entry.name = dir.name
+        entry.perms = dir.permissions
+        entry.owner = dir.owner
+        entry.group = dir.group
+        entry.can_read = dir.has_permission("r")
+        entry.can_write = dir.has_permission("w")
+        entry.can_exec = dir.has_permission("x")
+        globals.local_users.push(entry)
+    end for
+end function
+
+parse_loot_cache = function(path)
+    f = computer.File(path)
+    if not f then return
+    if f.is_binary then return
+    if not f.has_permission("r") then return
+
+    content = f.get_content
+    if content == null or content.len == 0 then return
+
+    lines = content.replace(CR, "").split(NL)
+    if lines.len < 2 then return
+
+    for line in lines[1:]
+        if line.len > 0 then
+            parts = line.split(TAB)
+            if parts.len >= 7 then
+                entry = {}
+                entry.host_public = parts[0]
+                entry.host_local = parts[1]
+                entry.user = parts[2]
+                entry.artifact_type = parts[3]
+                entry.account = parts[4]
+                entry.secret = parts[5]
+                entry.source = parts[6]
+                entry.notes = ""
+                if parts.len > 7 then entry.notes = parts[7]
+                globals.service_loot.push(entry)
+            end if
+        end if
+    end for
+end function
+
+parse_credential_cache = function(path)
+    f = computer.File(path)
+    if not f then return
+    if f.is_binary then return
+    if not f.has_permission("r") then return
+
+    content = f.get_content
+    if content == null or content.len == 0 then return
+
+    lines = content.replace(CR, "").split(NL)
+    if lines.len < 2 then return
+
+    for line in lines[1:]
+        if line.len > 0 then
+            parts = line.split(TAB)
+            if parts.len >= 5 then
+                entry = {}
+                entry.host_public = parts[0]
+                entry.host_local = parts[1]
+                entry.user = parts[2]
+                entry.password = parts[3]
+                entry.source = parts[4]
+                globals.credential_cache.push(entry)
+            end if
+        end if
+    end for
+end function
+
+scan_file = function(f)
+    globals.file_count = globals.file_count + 1
+
+    if not f then return
+    if f.is_folder then return
+    if f.is_binary then return
+    if not f.has_permission("r") then return
+
+    content = f.get_content
+    if content == null or content.len == 0 then return
+
+    kw = find_keyword(content)
+    if kw == null then return
+
+    globals.hit_count = globals.hit_count + 1
+    print("")
+    print("[HIT " + globals.hit_count + "] " + f.path + " | keyword=" + kw)
+    print("owner=" + f.owner + " group=" + f.group + " perms=" + f.permissions + " size=" + f.size)
+    print("preview=" + safe_preview(content, 220))
+end function
+
+walk = function(path, depth=0)
+    if depth > 2 then return
+    if globals.visited_dirs.indexOf(path) != null then return
+    globals.visited_dirs.push(path)
+
+    f = computer.File(path)
+    if not f then return
+
+    if not f.is_folder then
+        scan_file(f)
+        return
+    end if
+
+    if not f.has_permission("r") then return
+
+    globals.dir_count = globals.dir_count + 1
+
+    items = f.get_folders + f.get_files
+    for item in items
+        if item.is_folder then
+            walk(item.path, depth + 1)
+        else
+            scan_file(item)
+        end if
+    end for
+end function
+
+run_audit = function()
+    print("=== AUDIT ===")
+    print("user=" + active_user)
+    print("cwd=" + current_path)
+    print("host=" + computer.get_name)
+    print("local_ip=" + computer.local_ip)
+    print("public_ip=" + computer.public_ip)
+
+    print("")
+    print("=== PROCESSES ===")
+    print(computer.show_procs)
+
+    print("")
+    print("=== LOCAL PORTS ===")
+    router = get_router
+    ports = computer.get_ports
+    if ports == null or ports.len == 0 then
+        print("(none)")
+    else
+        for port in ports
+            if router then
+                print("  " + port.port_number + " -> " + router.port_info(port))
+            else
+                print("  " + port.port_number)
+            end if
+        end for
+    end if
+
+    for p in audit_paths
+        inspect_path(p)
+    end for
+end function
+
+run_pivot = function()
+    print("=== PIVOT ===")
+    print("host=" + computer.get_name + " | local=" + computer.local_ip + " | public=" + computer.public_ip)
+
+    collect_local_users
+    print("")
+    print("Visible local users:")
+    if globals.local_users.len == 0 then
+        print("(none)")
+    else
+        for u in globals.local_users
+            print("  " + u.name + " | perms=" + u.perms + " | access r=" + u.can_read + " w=" + u.can_write + " x=" + u.can_exec)
+        end for
+    end if
+
+    globals.service_loot = []
+    globals.credential_cache = []
+
+    parse_loot_cache(home + "/crs_v1_loot_cache.tsv")
+    parse_credential_cache(home + "/crs_v1_credential_cache.tsv")
+
+    print("")
+    print("Structured service loot:")
+    if globals.service_loot.len == 0 then
+        print("(none)")
+    else
+        for e in globals.service_loot
+            print("  user=" + e.user + " | type=" + e.artifact_type + " | account=" + e.account + " | secret=" + e.secret)
+            print("    source=" + e.source)
+            if e.notes.len > 0 then print("    notes=" + e.notes)
+        end for
+    end if
+
+    print("")
+    print("Structured credential cache:")
+    if globals.credential_cache.len == 0 then
+        print("(none)")
+    else
+        for e in globals.credential_cache
+            print("  user=" + e.user + " | password=" + e.password + " | source=" + e.source)
+        end for
+    end if
+
+    report_file = computer.File(home + "/crs/state/crs_v1_report.txt")
+    print("")
+    print("CRS report preview:")
+    if report_file and not report_file.is_binary and report_file.has_permission("r") then
+        print(safe_preview(report_file.get_content, 260))
+    else
+        print("(not readable)")
+    end if
+
+    print("")
+    print("Recommended manual pivots:")
+    if globals.service_loot.len == 0 and globals.credential_cache.len == 0 then
+        print("  - No structured pivot data found yet.")
+    else
+        for e in globals.service_loot
+            print("  - Service cred -> user=" + e.user + " | type=" + e.artifact_type + " | account=" + e.account + " | secret=" + e.secret)
+        end for
+        for e in globals.credential_cache
+            print("  - Host cred candidate -> user=" + e.user + " | password=" + e.password)
+        end for
+    end if
+    print("  - Treat mail/bank secrets as service creds first, not guaranteed OS passwords.")
+    print("  - Next host-only lane is readable /server + local service surface.")
+end function
+
+run_loot = function()
+    print("=== LOOT ===")
+    print("user=" + active_user)
+    print("cwd=" + current_path)
+    print("host=" + computer.get_name)
+
+    globals.visited_dirs = []
+    globals.hit_count = 0
+    globals.file_count = 0
+    globals.dir_count = 0
+
+    for root in scan_roots
+        print("")
+        print("Scanning root: " + root)
+        walk(root, 0)
+    end for
+
+    print("")
+    print("=== SUMMARY ===")
+    print("dirs_scanned=" + globals.dir_count)
+    print("files_scanned=" + globals.file_count)
+    print("hits=" + globals.hit_count)
+end function
+
+if mode == "audit" then
+    run_audit
+else if mode == "pivot" then
+    run_pivot
+else if mode == "loot" then
+    run_loot
+else if mode == "all" then
+    run_audit
+    print("")
+    print("========================================")
+    print("")
+    run_pivot
+    print("")
+    print("========================================")
+    print("")
+    run_loot
+else
+    exit("Usage: guest_recon_pivot_v1_1 [audit|pivot|loot|all]")
+end if

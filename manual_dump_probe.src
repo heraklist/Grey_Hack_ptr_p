@@ -1,0 +1,458 @@
+// Grey Hack Manual Dump Probe
+// Best effort only: checks whether Manual.exe is available as a readable
+// text-backed file. If yes, dumps it to txt. Otherwise it writes a report
+// explaining why GreyScript cannot fully export it.
+//
+// Example:
+// manual_dump_probe.src --path /bin/Manual.exe --quiet 0
+
+NL = char(10)
+CR = char(13)
+TAB = char(9)
+SCRIPT_BUILD = "2026-04-06-manual-dump-probe-a"
+MANUAL_MARKERS = [
+  "getting started",
+  "first steps",
+  "savegame",
+  "avoid traces",
+  "libraries & exploits",
+  "karma & reputation",
+  "general tips",
+  "websites & services",
+  "mail provider",
+  "bank",
+  "shop",
+  "hackshop",
+  "police station",
+  "rental of servers and isp",
+  "coin creation",
+  "ctf events",
+  "terminal commands",
+  "basic commands",
+  "network commands",
+  "server installers",
+  "permissions and users",
+  "security",
+]
+
+appendLine = function(lines, text)
+  lines.push(text)
+end function
+
+isError = function(value)
+  return value isa string and value != ""
+end function
+
+normalizeInput = function(value)
+  if value == null then return ""
+  return str(value)
+end function
+
+normalizeText = function(value)
+  clean = ""
+  for ch in normalizeInput(value)
+    if ch != CR then clean = clean + ch
+  end for
+  return clean
+end function
+
+listHasValue = function(items, wanted)
+  if items == null then return 0
+  for item in items
+    if item == wanted then return 1
+  end for
+  return 0
+end function
+
+pushUniqueString = function(values, seen, rawValue)
+  valueText = normalizeInput(rawValue).trim
+  if valueText == "" then return 0
+  if listHasValue(seen, valueText) then return 0
+  seen.push(valueText)
+  values.push(valueText)
+  return 1
+end function
+
+toYesNoFlag = function(inputValue, defaultValue = 1)
+  lowered = normalizeInput(inputValue).trim.lower
+  if lowered == "" then return defaultValue
+  if lowered == "y" or lowered == "yes" or lowered == "1" or lowered == "true" then return 1
+  if lowered == "n" or lowered == "no" or lowered == "0" or lowered == "false" then return 0
+  return defaultValue
+end function
+
+isNumericText = function(textValue)
+  text = normalizeInput(textValue).trim
+  if text == "" then return 0
+
+  for ch in text
+    if ch < "0" or ch > "9" then return 0
+  end for
+
+  return 1
+end function
+
+parsePositiveInt = function(rawValue, defaultValue, minValue = 0, maxValue = 9999)
+  text = normalizeInput(rawValue).trim
+  if text == "" then return defaultValue
+  if not isNumericText(text) then return defaultValue
+
+  parsed = text.val
+  if parsed < minValue then return minValue
+  if parsed > maxValue then return maxValue
+  return parsed
+end function
+
+getParamValue = function(flagName, defaultValue = "")
+  if params == null then return defaultValue
+
+  flagIndex = params.indexOf(flagName)
+  if flagIndex == null then return defaultValue
+
+  nextIndex = flagIndex + 1
+  if not params.hasIndex(nextIndex) then return defaultValue
+  return params[nextIndex]
+end function
+
+getParamFlag = function(flagName, defaultValue = 0)
+  return toYesNoFlag(getParamValue(flagName, ""), defaultValue)
+end function
+
+ensureFolder = function(computer, parentPath, folderName)
+  folderPath = parentPath + "/" + folderName
+  folder = computer.File(folderPath)
+  if folder != null then return folderPath
+
+  created = computer.create_folder(parentPath, folderName)
+  if created == 1 then return folderPath
+  return null
+end function
+
+ensureTextFile = function(computer, dirPath, fileName)
+  filePath = dirPath + "/" + fileName
+  file = computer.File(filePath)
+  if file != null then return file
+
+  created = computer.touch(dirPath, fileName)
+  if isError(created) then return null
+  return computer.File(filePath)
+end function
+
+resolveOutputDir = function(computer, sharedDir = "")
+  normalizedSharedDir = normalizeInput(sharedDir).trim
+  if normalizedSharedDir != "" then
+    sharedFolder = computer.File(normalizedSharedDir)
+    if sharedFolder != null and sharedFolder.is_folder and sharedFolder.has_permission("w") then return normalizedSharedDir
+  end if
+
+  outputDir = ensureFolder(computer, home_dir, "loot")
+  if outputDir == null then outputDir = home_dir
+  return outputDir
+end function
+
+formatValue = function(value, defaultValue = "-")
+  text = normalizeInput(value)
+  if text == "" then return defaultValue
+  return text
+end function
+
+parentDir = function(pathText)
+  normalized = normalizeInput(pathText).trim
+  if normalized == "" then return ""
+  return normalizeInput(parent_path(normalized)).trim
+end function
+
+buildCandidatePaths = function(requestedPath, includeCommonPaths = 1)
+  paths = []
+  seen = []
+
+  requested = normalizeInput(requestedPath).trim
+  if requested != "" then pushUniqueString(paths, seen, requested)
+
+  if includeCommonPaths then
+    pushUniqueString(paths, seen, "/bin/Manual.exe")
+    pushUniqueString(paths, seen, "/usr/bin/Manual.exe")
+    pushUniqueString(paths, seen, home_dir + "/Desktop/Manual.exe")
+    pushUniqueString(paths, seen, home_dir + "/bin/Manual.exe")
+    pushUniqueString(paths, seen, home_dir + "/Manual.exe")
+  end if
+
+  return paths
+end function
+
+tryReadText = function(file)
+  if file == null then return null
+  if file.is_folder then return null
+  if file.is_binary then return null
+  if not file.has_permission("r") then return null
+  return normalizeText(file.get_content)
+end function
+
+containsManualMarker = function(textValue)
+  lowered = normalizeInput(textValue).lower
+  if lowered == "" then return ""
+
+  for marker in MANUAL_MARKERS
+    if lowered.indexOf(marker) != null then return marker
+  end for
+
+  return ""
+end function
+
+buildSearchRoots = function(candidatePaths)
+  roots = []
+  seen = []
+
+  pushUniqueString(roots, seen, "/bin")
+  pushUniqueString(roots, seen, "/usr")
+  pushUniqueString(roots, seen, "/usr/bin")
+  pushUniqueString(roots, seen, "/lib")
+  pushUniqueString(roots, seen, "/etc")
+  pushUniqueString(roots, seen, home_dir)
+  pushUniqueString(roots, seen, home_dir + "/Desktop")
+  pushUniqueString(roots, seen, current_path)
+
+  if candidatePaths != null then
+    for candidatePath in candidatePaths
+      pushUniqueString(roots, seen, parentDir(candidatePath))
+    end for
+  end if
+
+  return roots
+end function
+
+recordDumpedPath = function(scanState, pathText)
+  normalizedPath = normalizeInput(pathText).trim
+  if normalizedPath == "" then return 0
+  if listHasValue(scanState.dumped_paths, normalizedPath) then return 0
+  scanState.dumped_paths.push(normalizedPath)
+  return 1
+end function
+
+scanManualAssetPath = function(pathObject, depth, reportLines, dumpLines, scanState)
+  if pathObject == null then return
+  if scanState.scanned_files >= scanState.max_files then return
+
+  pathText = normalizeInput(pathObject.path)
+  if pathText == "" then return
+  if listHasValue(scanState.visited_paths, pathText) then return
+  scanState.visited_paths.push(pathText)
+
+  if pathObject.is_folder then
+    if depth > scanState.max_depth then
+      scanState.depth_cutoffs = scanState.depth_cutoffs + 1
+      return
+    end if
+
+    if not pathObject.has_permission("r") then
+      scanState.unreadable_paths = scanState.unreadable_paths + 1
+      return
+    end if
+
+    subFolders = pathObject.get_folders
+    if subFolders != null then
+      for subFolder in subFolders
+        if subFolder == null then continue
+        scanManualAssetPath(subFolder, depth + 1, reportLines, dumpLines, scanState)
+        if scanState.scanned_files >= scanState.max_files then return
+      end for
+    end if
+
+    files = pathObject.get_files
+    if files != null then
+      for file in files
+        if file == null then continue
+        scanManualAssetPath(file, depth + 1, reportLines, dumpLines, scanState)
+        if scanState.scanned_files >= scanState.max_files then return
+      end for
+    end if
+
+    return
+  end if
+
+  scanState.scanned_files = scanState.scanned_files + 1
+
+  textContent = tryReadText(pathObject)
+  if textContent == null or textContent == "" then return
+
+  marker = containsManualMarker(pathText)
+  if marker == "" then marker = containsManualMarker(textContent)
+  if marker == "" then return
+
+  if not recordDumpedPath(scanState, pathText) then return
+
+  scanState.matches = scanState.matches + 1
+  appendLine(reportLines, "Manual asset match: " + pathText + " [marker: " + marker + "]")
+  appendLine(dumpLines, "===== ASSET " + pathText + " =====")
+  appendLine(dumpLines, textContent)
+  appendLine(dumpLines, "")
+end function
+
+probePath = function(remoteComputer, pathText, reportLines, dumpLines)
+  normalizedPath = normalizeInput(pathText).trim
+  if normalizedPath == "" then return 0
+
+  appendLine(reportLines, "Path: " + normalizedPath)
+
+  pathObject = remoteComputer.File(normalizedPath)
+  if pathObject == null then
+    appendLine(reportLines, "Status: missing")
+    appendLine(reportLines, "")
+    return 0
+  end if
+
+  appendLine(reportLines, "Status: found")
+  appendLine(reportLines, "Owner: " + formatValue(pathObject.owner))
+  appendLine(reportLines, "Permissions: " + formatValue(pathObject.permissions))
+  appendLine(reportLines, "Size: " + formatValue(pathObject.size))
+  appendLine(reportLines, "Is folder: " + pathObject.is_folder)
+  appendLine(reportLines, "Is binary: " + pathObject.is_binary)
+  appendLine(reportLines, "Readable: " + pathObject.has_permission("r"))
+  appendLine(reportLines, "Writable: " + pathObject.has_permission("w"))
+
+  if pathObject.is_folder then
+    appendLine(reportLines, "Dump: not available")
+    appendLine(reportLines, "Reason: target resolves to a folder, not a manual document.")
+    appendLine(reportLines, "")
+    return 0
+  end if
+
+  textContent = tryReadText(pathObject)
+  if textContent == null or textContent == "" then
+    appendLine(reportLines, "Dump: not available")
+
+    if pathObject.is_binary then
+      appendLine(reportLines, "Reason: target is a binary .exe. GreyScript can inspect file metadata, but it cannot export GUI program text from the executable itself.")
+    else
+      if not pathObject.has_permission("r") then
+        appendLine(reportLines, "Reason: missing read permission on target file.")
+      else
+        appendLine(reportLines, "Reason: file is readable but returned no text content.")
+      end if
+    end if
+
+    appendLine(reportLines, "")
+    return 0
+  end if
+
+  appendLine(reportLines, "Dump: text extracted")
+  appendLine(reportLines, "Text lines: " + textContent.split(NL).len)
+  appendLine(reportLines, "")
+
+  appendLine(dumpLines, "===== " + normalizedPath + " =====")
+  appendLine(dumpLines, textContent)
+  appendLine(dumpLines, "")
+  return 1
+end function
+
+requestedPath = normalizeInput(getParamValue("--path", "")).trim
+sharedDir = normalizeInput(getParamValue("--shared-dir", "")).trim
+quietMode = getParamFlag("--quiet", 0)
+includeCommonPaths = getParamFlag("--common-paths", 1)
+scanAssets = getParamFlag("--scan-assets", 1)
+scanDepth = parsePositiveInt(getParamValue("--max-depth", ""), 3, 0, 8)
+scanFileLimit = parsePositiveInt(getParamValue("--max-files", ""), 250, 20, 4000)
+
+outputDir = resolveOutputDir(computer, sharedDir)
+if outputDir == null then exit("No writable output directory found.")
+
+reportFile = ensureTextFile(computer, outputDir, "manual_probe_report.txt")
+dumpFile = ensureTextFile(computer, outputDir, "manual_dump.txt")
+
+if reportFile == null then exit("Failed to create manual_probe_report.txt")
+if dumpFile == null then exit("Failed to create manual_dump.txt")
+
+candidatePaths = buildCandidatePaths(requestedPath, includeCommonPaths)
+if candidatePaths.len == 0 then exit("No candidate Manual.exe paths were provided.")
+
+reportLines = []
+dumpLines = []
+
+appendLine(reportLines, "Grey Hack Manual.exe Dump Probe")
+appendLine(reportLines, "Build: " + SCRIPT_BUILD)
+appendLine(reportLines, "Host public IP: " + formatValue(computer.public_ip))
+appendLine(reportLines, "Host local IP: " + formatValue(computer.local_ip))
+appendLine(reportLines, "User: " + formatValue(active_user))
+appendLine(reportLines, "Program path: " + formatValue(program_path))
+appendLine(reportLines, "Current path: " + formatValue(current_path))
+appendLine(reportLines, "Home dir: " + formatValue(home_dir))
+appendLine(reportLines, "Output dir: " + outputDir)
+appendLine(reportLines, "Candidate paths: " + candidatePaths.join(", "))
+appendLine(reportLines, "")
+
+textDumpCount = 0
+for candidatePath in candidatePaths
+  textDumpCount = textDumpCount + probePath(computer, candidatePath, reportLines, dumpLines)
+end for
+
+scanState = {
+  "max_depth": scanDepth,
+  "max_files": scanFileLimit,
+  "scanned_files": 0,
+  "matches": 0,
+  "visited_paths": [],
+  "dumped_paths": [],
+  "unreadable_paths": 0,
+  "depth_cutoffs": 0,
+}
+
+if scanAssets then
+  appendLine(reportLines, "Asset Scan")
+  appendLine(reportLines, "----------")
+  searchRoots = buildSearchRoots(candidatePaths)
+  appendLine(reportLines, "Search roots: " + searchRoots.join(", "))
+  appendLine(reportLines, "Max depth: " + scanState.max_depth)
+  appendLine(reportLines, "Max files: " + scanState.max_files)
+
+  for searchRoot in searchRoots
+    rootObject = computer.File(searchRoot)
+    if rootObject == null then continue
+    scanManualAssetPath(rootObject, 0, reportLines, dumpLines, scanState)
+    if scanState.scanned_files >= scanState.max_files then break
+  end for
+
+  appendLine(reportLines, "Scanned text files: " + scanState.scanned_files)
+  appendLine(reportLines, "Asset matches: " + scanState.matches)
+  appendLine(reportLines, "Unreadable paths: " + scanState.unreadable_paths)
+  appendLine(reportLines, "Depth cutoffs: " + scanState.depth_cutoffs)
+  appendLine(reportLines, "")
+end if
+
+appendLine(reportLines, "Conclusion")
+appendLine(reportLines, "----------")
+appendLine(reportLines, "Executable text dumps: " + textDumpCount)
+appendLine(reportLines, "Manual asset matches: " + scanState.matches)
+
+if textDumpCount == 0 and scanState.matches == 0 then
+  appendLine(reportLines, "No full manual text export was possible from GreyScript.")
+  appendLine(reportLines, "If Manual.exe is the normal GUI executable, this is expected: GreyScript works with script files and readable text files, not with extracting UI content from non-script executables.")
+else
+  appendLine(reportLines, "Readable manual-related text was copied to manual_dump.txt.")
+end if
+
+appendLine(reportLines, "")
+appendLine(reportLines, "Notes")
+appendLine(reportLines, "-----")
+appendLine(reportLines, "Use --path to target an exact Manual.exe location if yours differs.")
+appendLine(reportLines, "Use --common-paths 0 to probe only the path you provide.")
+appendLine(reportLines, "Use --scan-assets 0 if you want only the executable probe.")
+appendLine(reportLines, "Use --max-depth and --max-files to widen or narrow the backend asset search.")
+
+if dumpLines.len == 0 then
+  appendLine(dumpLines, "No readable manual text was extracted.")
+  appendLine(dumpLines, "Check manual_probe_report.txt for the exact reason recorded for each candidate path.")
+end if
+
+saveReportResult = reportFile.set_content(reportLines.join(NL))
+if isError(saveReportResult) then exit("Failed to save report: " + saveReportResult)
+
+saveDumpResult = dumpFile.set_content(dumpLines.join(NL))
+if isError(saveDumpResult) then exit("Failed to save dump: " + saveDumpResult)
+
+if not quietMode then
+  print("Manual probe report saved to " + reportFile.path)
+  print("Manual dump output saved to " + dumpFile.path)
+  print("Build: " + SCRIPT_BUILD)
+  print("Executable text dumps: " + textDumpCount)
+  print("Manual asset matches: " + scanState.matches)
+end if

@@ -1,0 +1,1600 @@
+// guest_recon_pivot_v1.src
+// modes: audit | pivot | loot | exploit | all
+// purpose: lean guest foothold recon / loot / pivot / exploit helper
+// thin CRS-backed operator helper, not a full autonomous engine
+
+shell = get_shell
+if not shell then exit("No active shell")
+
+computer = shell.host_computer
+if not computer then exit("No host computer")
+
+mode = "all"
+if params and params.len > 0 then mode = params[0].lower
+
+TAB = char(9)
+NL = char(10)
+CR = char(13)
+
+home = home_dir
+crs_output_dir_hint = ""
+if params and params.len > 1 then crs_output_dir_hint = params[1]
+
+CRS_OUTPUT_FOLDER = "crs"
+CRS_OUTPUT_SUBFOLDER = "state"
+CRS_REPORT_NAME = "crs_v1_report.txt"
+CRS_HOST_CACHE_NAME = "crs_v1_host_cache.tsv"
+CRS_CREDENTIAL_CACHE_NAME = "crs_v1_credential_cache.tsv"
+CRS_SIGNATURE_CACHE_NAME = "crs_v1_signature_cache.tsv"
+CRS_SURFACE_CACHE_NAME = "crs_v1_surface_cache.tsv"
+CRS_LOOT_CACHE_NAME = "crs_v1_loot_cache.tsv"
+MAX_CREDENTIAL_REPLAY_ATTEMPTS = 32
+MAX_OVERFLOW_REPLAY_ATTEMPTS = 48
+MAX_LOCAL_CREDENTIAL_FILES = 40
+MAX_LOCAL_CREDENTIAL_LINES = 60
+MAX_LOCAL_CREDENTIAL_CANDIDATES = 40
+TOKEN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.:@/$"
+
+keywords = ["pass", "password", "passwd", "mail", "bank", "secret", "token", "key", "ssh", "ftp", "login", "user", "backup", "config", "todo"]
+credential_keywords = ["pass", "passwd", "password", "pwd", "user", "username", "login", "credential", "secret", "token", "auth", "ftp", "ssh", "mail", "bank", "wallet", "card", "pin", "config"]
+audit_paths = [home, "/home", "/var", "/server", "/Public", "/boot", "/bin", "/usr/bin"]
+scan_roots = [home, home + "/crs", "/server", "/Public", "/boot"]
+local_credential_scan_roots = ["/etc", "/home", "/server", "/var"]
+
+globals.visited_dirs = {}
+globals.local_users = []
+globals.host_cache = []
+globals.signature_cache = []
+globals.surface_cache = []
+globals.service_loot = []
+globals.credential_cache = []
+globals.local_credential_users = []
+globals.local_password_candidates = []
+globals.local_credential_scanned_files = 0
+globals.local_explicit_credentials = 0
+globals.hit_count = 0
+globals.file_count = 0
+globals.dir_count = 0
+
+safe_preview = function(text, max_len=180)
+    if text == null then return ""
+    out = text.replace(CR, "")
+    out = out.replace(NL, " | ")
+    if out.len > max_len then out = out[:max_len] + "..."
+    return out
+end function
+
+find_keyword = function(text)
+    if text == null or text.len == 0 then return null
+    low = text.lower
+    for kw in keywords
+        if low.indexOf(kw) != null then return kw
+    end for
+    return null
+end function
+
+print_entry = function(f)
+    ftype = "FILE"
+    if f.is_folder then ftype = "DIR"
+    access = "r:" + f.has_permission("r") + " w:" + f.has_permission("w") + " x:" + f.has_permission("x")
+    print("  [" + ftype + "] " + f.name + " | " + f.permissions + " | " + f.owner + ":" + f.group + " | " + access + " | " + f.size + "b")
+end function
+
+inspect_path = function(path)
+    f = computer.File(path)
+
+    print("")
+    print("== " + path + " ==")
+
+    if not f then
+        print("Missing / not found")
+        return
+    end if
+
+    if f.is_folder then
+        print("Type: folder")
+    else
+        print("Type: file")
+    end if
+
+    print("Perms: " + f.permissions)
+    print("Owner: " + f.owner + ":" + f.group)
+    print("Access: r=" + f.has_permission("r") + " w=" + f.has_permission("w") + " x=" + f.has_permission("x"))
+
+    if f.is_folder then
+        if not f.has_permission("r") then
+            print("No read permission for directory listing")
+            return
+        end if
+
+        items = f.get_folders + f.get_files
+        if items.len == 0 then
+            print("(empty)")
+            return
+        end if
+
+        shown = 0
+        for item in items
+            print_entry(item)
+            shown = shown + 1
+            if shown >= 15 then
+                print("  ... truncated ...")
+                break
+            end if
+        end for
+
+    else
+        if f.is_binary then
+            print("Binary file")
+            return
+        end if
+
+        if not f.has_permission("r") then
+            print("No read permission for file content")
+            return
+        end if
+
+        print("Preview:")
+        print(safe_preview(f.get_content, 220))
+    end if
+end function
+
+push_unique_path = function(paths, seen_paths, path)
+    if path == null then return
+
+    normalized = path.trim
+    if normalized.len == 0 then return
+    if seen_paths.hasIndex(normalized) then return
+
+    seen_paths[normalized] = 1
+    paths.push(normalized)
+end function
+
+join_path = function(base_path, child_name)
+    if base_path == null then return ""
+    if child_name == null or child_name.len == 0 then return base_path
+    if base_path.len == 0 then return child_name
+    if base_path[base_path.len - 1] == "/" then return base_path + child_name
+    return base_path + "/" + child_name
+end function
+
+build_crs_candidate_dirs = function()
+    candidate_dirs = []
+    seen_dirs = {}
+
+    if crs_output_dir_hint.len > 0 then
+        push_unique_path(candidate_dirs, seen_dirs, crs_output_dir_hint)
+        push_unique_path(candidate_dirs, seen_dirs, join_path(crs_output_dir_hint, CRS_OUTPUT_SUBFOLDER))
+    end if
+
+    home_output_root = join_path(home, CRS_OUTPUT_FOLDER)
+    current_output_root = join_path(current_path, CRS_OUTPUT_FOLDER)
+
+    push_unique_path(candidate_dirs, seen_dirs, join_path(home_output_root, CRS_OUTPUT_SUBFOLDER))
+    push_unique_path(candidate_dirs, seen_dirs, home_output_root)
+    push_unique_path(candidate_dirs, seen_dirs, home)
+    push_unique_path(candidate_dirs, seen_dirs, join_path(current_output_root, CRS_OUTPUT_SUBFOLDER))
+    push_unique_path(candidate_dirs, seen_dirs, current_output_root)
+    push_unique_path(candidate_dirs, seen_dirs, current_path)
+
+    return candidate_dirs
+end function
+
+find_first_artifact = function(file_name)
+    for dir_path in build_crs_candidate_dirs
+        artifact_file = computer.File(join_path(dir_path, file_name))
+        if artifact_file then return artifact_file
+    end for
+
+    return null
+end function
+
+discover_crs_artifacts = function()
+    artifacts = {}
+    artifacts.report_file = find_first_artifact(CRS_REPORT_NAME)
+    artifacts.host_cache_file = find_first_artifact(CRS_HOST_CACHE_NAME)
+    artifacts.credential_cache_file = find_first_artifact(CRS_CREDENTIAL_CACHE_NAME)
+    artifacts.signature_cache_file = find_first_artifact(CRS_SIGNATURE_CACHE_NAME)
+    artifacts.surface_cache_file = find_first_artifact(CRS_SURFACE_CACHE_NAME)
+    artifacts.loot_cache_file = find_first_artifact(CRS_LOOT_CACHE_NAME)
+    artifacts.location_dirs = []
+
+    seen_dirs = {}
+    for artifact_file in [artifacts.report_file, artifacts.host_cache_file, artifacts.credential_cache_file, artifacts.signature_cache_file, artifacts.surface_cache_file, artifacts.loot_cache_file]
+        if artifact_file then push_unique_path(artifacts.location_dirs, seen_dirs, parent_path(artifact_file.path))
+    end for
+
+    return artifacts
+end function
+
+reset_crs_cache_state = function()
+    globals.host_cache = []
+    globals.signature_cache = []
+    globals.surface_cache = []
+    globals.service_loot = []
+    globals.credential_cache = []
+end function
+
+is_numeric_text = function(text_value)
+    if text_value == null then return 0
+
+    clean = text_value.trim
+    if clean.len == 0 then return 0
+
+    for ch in clean
+        if ch < "0" or ch > "9" then return 0
+    end for
+
+    return 1
+end function
+
+to_number_or_default = function(text_value, default_value=0)
+    if not is_numeric_text(text_value) then return default_value
+    return text_value.trim.to_int
+end function
+
+parse_port_numbers = function(ports_text)
+    ports = []
+    if ports_text == null then return ports
+
+    clean = ports_text.trim
+    if clean.len == 0 or clean == "none" then return ports
+
+    for port_text in clean.split(",")
+        normalized_port = port_text.trim
+        if is_numeric_text(normalized_port) then ports.push(normalized_port.to_int)
+    end for
+
+    return ports
+end function
+
+has_open_port = function(host_record, port_number)
+    if host_record == null then return 0
+    if host_record.open_ports == null then return 0
+
+    for open_port in host_record.open_ports
+        if open_port == port_number then return 1
+    end for
+
+    return 0
+end function
+
+print_crs_artifact_locations = function(artifacts)
+    print("")
+    print("CRS artifacts:")
+
+    if artifacts == null then
+        print("(not found)")
+        return
+    end if
+
+    if artifacts.location_dirs == null or artifacts.location_dirs.len == 0 then
+        if crs_output_dir_hint.len > 0 then
+            print("(not found under hint or standard CRS output paths)")
+        else
+            print("(not found under standard CRS output paths)")
+            print("Pass a CRS output dir as the second arg for shared-dir outputs.")
+        end if
+        return
+    end if
+
+    if artifacts.report_file then print("  report=" + artifacts.report_file.path)
+    if artifacts.host_cache_file then print("  host_cache=" + artifacts.host_cache_file.path)
+    if artifacts.credential_cache_file then print("  credential_cache=" + artifacts.credential_cache_file.path)
+    if artifacts.signature_cache_file then print("  signature_cache=" + artifacts.signature_cache_file.path)
+    if artifacts.surface_cache_file then print("  surface_cache=" + artifacts.surface_cache_file.path)
+    if artifacts.loot_cache_file then print("  loot_cache=" + artifacts.loot_cache_file.path)
+end function
+
+load_host_cache = function(path)
+    f = computer.File(path)
+    if not f then return
+    if f.is_binary then return
+    if not f.has_permission("r") then return
+
+    content = f.get_content
+    if content == null or content.len == 0 then return
+
+    lines = content.replace(CR, "").split(NL)
+    if lines.len < 2 then return
+
+    for line in lines[1:]
+        if line.len == 0 then continue
+
+        parts = line.split(TAB)
+        if parts.len < 9 then continue
+        if parts[0] == "ip" and parts[1] == "public_ip" then continue
+
+        entry = {}
+        entry.ip = parts[0]
+        entry.public_ip = parts[1]
+        entry.lan_ip = parts[2]
+        entry.gateway_ip = parts[3]
+        entry.role = parts[4]
+        entry.priority = parts[5]
+        entry.score = to_number_or_default(parts[6], 0)
+        entry.ports_text = parts[7]
+        entry.open_ports = parse_port_numbers(parts[7])
+        entry.source = parts[8]
+        globals.host_cache.push(entry)
+    end for
+end function
+
+parse_signature_cache = function(path)
+    f = computer.File(path)
+    if not f then return
+    if f.is_binary then return
+    if not f.has_permission("r") then return
+
+    content = f.get_content
+    if content == null or content.len == 0 then return
+
+    lines = content.replace(CR, "").split(NL)
+    if lines.len < 2 then return
+
+    for line in lines[1:]
+        if line.len == 0 then continue
+
+        parts = line.split(TAB)
+        if parts.len < 6 then continue
+        if parts[0] == "lib" and parts[1] == "version" then continue
+
+        entry = {}
+        entry.lib = parts[0]
+        entry.version = parts[1]
+        entry.port = parts[2]
+        entry.memory = parts[3]
+        entry.unsafe = parts[4]
+        entry.result_type = parts[5]
+        globals.signature_cache.push(entry)
+    end for
+end function
+
+parse_surface_cache = function(path)
+    f = computer.File(path)
+    if not f then return
+    if f.is_binary then return
+    if not f.has_permission("r") then return
+
+    content = f.get_content
+    if content == null or content.len == 0 then return
+
+    lines = content.replace(CR, "").split(NL)
+    if lines.len < 2 then return
+
+    for line in lines[1:]
+        if line.len == 0 then continue
+
+        parts = line.split(TAB)
+        if parts.len < 10 then continue
+        if parts[0] == "host_ip" and parts[1] == "host_public" then continue
+
+        entry = {}
+        entry.host_ip = parts[0]
+        entry.host_public = parts[1]
+        entry.host_local = parts[2]
+        entry.port = parts[3]
+        entry.lib = parts[4]
+        entry.version = parts[5]
+        entry.memory = parts[6]
+        entry.unsafe = parts[7]
+        entry.origin = parts[8]
+        entry.scan_info = parts[9]
+        globals.surface_cache.push(entry)
+    end for
+end function
+
+load_crs_artifact_data = function(artifacts)
+    reset_crs_cache_state
+
+    if artifacts == null then return
+    if artifacts.host_cache_file then load_host_cache(artifacts.host_cache_file.path)
+    if artifacts.credential_cache_file then parse_credential_cache(artifacts.credential_cache_file.path)
+    if artifacts.signature_cache_file then parse_signature_cache(artifacts.signature_cache_file.path)
+    if artifacts.surface_cache_file then parse_surface_cache(artifacts.surface_cache_file.path)
+    if artifacts.loot_cache_file then parse_loot_cache(artifacts.loot_cache_file.path)
+end function
+
+collect_local_users = function()
+    globals.local_users = []
+
+    home_root = computer.File("/home")
+    if not home_root then return
+    if not home_root.is_folder then return
+    if not home_root.has_permission("r") then return
+
+    for dir in home_root.get_folders
+        entry = {}
+        entry.name = dir.name
+        entry.perms = dir.permissions
+        entry.owner = dir.owner
+        entry.group = dir.group
+        entry.can_read = dir.has_permission("r")
+        entry.can_write = dir.has_permission("w")
+        entry.can_exec = dir.has_permission("x")
+        globals.local_users.push(entry)
+    end for
+end function
+
+normalize_text = function(value, default_value="")
+    if value == null then return default_value
+
+    clean = ""
+    for ch in str(value)
+        if ch != CR then clean = clean + ch
+    end for
+
+    return clean
+end function
+
+read_text_file = function(file)
+    if file == null then return null
+    if file.is_folder then return null
+    if file.is_binary then return null
+    if not file.has_permission("r") then return null
+    return normalize_text(file.get_content)
+end function
+
+list_has_value = function(items, wanted)
+    if items == null then return 0
+
+    for item in items
+        if item == wanted then return 1
+    end for
+
+    return 0
+end function
+
+push_unique_string = function(values, seen, raw_value)
+    value_text = normalize_text(raw_value).trim
+    if value_text == "" then return 0
+    if list_has_value(seen, value_text) then return 0
+
+    seen.push(value_text)
+    values.push(value_text)
+    return 1
+end function
+
+contains_credential_keyword = function(text_value)
+    lowered = normalize_text(text_value).trim.lower
+    if lowered == "" then return 0
+
+    for keyword in credential_keywords
+        if lowered.indexOf(keyword) != null then return 1
+    end for
+
+    return 0
+end function
+
+is_token_char = function(ch)
+    if ch == null or ch == "" then return 0
+    return TOKEN_CHARS.indexOf(ch) != null
+end function
+
+extract_tokens = function(text_value, min_len = 3)
+    tokens = []
+    current = ""
+
+    for ch in normalize_text(text_value)
+        if is_token_char(ch) then
+            current = current + ch
+        else
+            if current.len >= min_len then tokens.push(current)
+            current = ""
+        end if
+    end for
+
+    if current.len >= min_len then tokens.push(current)
+    return tokens
+end function
+
+resolve_structured_secret = function(crypto, raw_value, allow_decipher = 1)
+    secret_text = normalize_text(raw_value).trim
+    if secret_text == "" then return ""
+    if crypto == null or not allow_decipher then return secret_text
+
+    deciphered = crypto.decipher(secret_text)
+    deciphered_text = normalize_text(deciphered).trim
+    if deciphered_text != "" and deciphered_text != secret_text then return deciphered_text
+    return secret_text
+end function
+
+push_password_candidate = function(candidates, seen, raw_value, source_text)
+    candidate_value = normalize_text(raw_value).trim
+    if candidate_value == "" then return 0
+    if candidate_value.len < 3 then return 0
+    if candidate_value.len > 64 then return 0
+    if list_has_value(seen, candidate_value) then return 0
+
+    seen.push(candidate_value)
+    candidates.push({"value":candidate_value, "source":normalize_text(source_text).trim})
+    return 1
+end function
+
+add_password_candidate_variants = function(crypto, candidates, seen, raw_value, source_text, allow_decipher = 0)
+    added = push_password_candidate(candidates, seen, raw_value, source_text)
+
+    if crypto == null or not allow_decipher then return added
+
+    deciphered = crypto.decipher(normalize_text(raw_value).trim)
+    deciphered_text = normalize_text(deciphered).trim
+    if deciphered_text != "" and deciphered_text != normalize_text(raw_value).trim then
+        added = added + push_password_candidate(candidates, seen, deciphered_text, source_text + " [decipher]")
+    end if
+
+    return added
+end function
+
+push_local_loot_record = function(user_name, artifact_type, account_name, secret_value, source_path, notes_text = "")
+    for existing_record in globals.service_loot
+        if existing_record.host_public != computer.public_ip then continue
+        if existing_record.host_local != computer.local_ip then continue
+        if existing_record.user != user_name then continue
+        if existing_record.artifact_type != artifact_type then continue
+        if existing_record.account != account_name then continue
+        if existing_record.source != source_path then continue
+        return 0
+    end for
+
+    entry = {}
+    entry.host_public = computer.public_ip
+    entry.host_local = computer.local_ip
+    entry.user = user_name
+    entry.artifact_type = artifact_type
+    entry.account = account_name
+    entry.secret = secret_value
+    entry.source = source_path
+    entry.notes = notes_text
+    globals.service_loot.push(entry)
+    return 1
+end function
+
+push_local_credential_record = function(user_name, password_value, source_text)
+    if user_name == null or password_value == null then return 0
+
+    clean_user = normalize_text(user_name).trim
+    clean_password = normalize_text(password_value).trim
+    clean_source = normalize_text(source_text).trim
+    if clean_user == "" or clean_password == "" then return 0
+
+    for existing_record in globals.credential_cache
+        if existing_record.host_public != computer.public_ip then continue
+        if existing_record.host_local != computer.local_ip then continue
+        if existing_record.user != clean_user then continue
+        if existing_record.password != clean_password then continue
+        return 0
+    end for
+
+    entry = {}
+    entry.host_public = computer.public_ip
+    entry.host_local = computer.local_ip
+    entry.user = clean_user
+    entry.password = clean_password
+    entry.source = clean_source
+    globals.credential_cache.push(entry)
+    return 1
+end function
+
+collect_local_credential_users = function()
+    users = []
+    seen = []
+
+    push_unique_string(users, seen, active_user)
+    push_unique_string(users, seen, "root")
+    push_unique_string(users, seen, "admin")
+
+    passwd_content = read_text_file(computer.File("/etc/passwd"))
+    if passwd_content != null and passwd_content != "" then
+        for line in passwd_content.split(NL)
+            clean_line = normalize_text(line).trim
+            if clean_line == "" then continue
+
+            parts = clean_line.split(":")
+            if parts == null or parts.len == 0 then continue
+            push_unique_string(users, seen, parts[0])
+        end for
+    end if
+
+    home_root = computer.File("/home")
+    if home_root != null and home_root.is_folder and home_root.has_permission("r") then
+        for user_dir in home_root.get_folders
+            if user_dir == null then continue
+            push_unique_string(users, seen, user_dir.name)
+        end for
+    end if
+
+    return users
+end function
+
+collect_password_candidates_from_line = function(crypto, candidates, seen, line_text, source_text, target_user = "", max_candidates = MAX_LOCAL_CREDENTIAL_CANDIDATES, allow_decipher = 0)
+    if candidates.len >= max_candidates then return 0
+
+    normalized_line = normalize_text(line_text).trim
+    if normalized_line == "" then return 0
+
+    line_lower = normalized_line.lower
+    source_lower = normalize_text(source_text).trim.lower
+    interested = contains_credential_keyword(source_lower) or contains_credential_keyword(line_lower) or source_lower.indexOf("passwd") != null or source_lower.indexOf("shadow") != null
+    if target_user != "" and line_lower.indexOf(target_user.lower) != null then interested = 1
+    if not interested and normalized_line.indexOf(":") == null then return 0
+
+    added = 0
+    fields = normalized_line.split(":")
+    field_index = 0
+    if fields != null and fields.len > 1 then
+        for field in fields
+            if candidates.len >= max_candidates then return added
+
+            field_index = field_index + 1
+            field_value = normalize_text(field).trim
+            if field_value == "" then continue
+            if field_index == 1 then continue
+            added = added + add_password_candidate_variants(crypto, candidates, seen, field_value, source_text + " [field " + field_index + "]", allow_decipher)
+        end for
+    end if
+
+    for token in extract_tokens(normalized_line, 4)
+        if candidates.len >= max_candidates then return added
+        added = added + add_password_candidate_variants(crypto, candidates, seen, token, source_text + " [token]", allow_decipher)
+    end for
+
+    return added
+end function
+
+collect_password_candidates_from_file = function(crypto, file, candidates, seen, target_user = "", max_lines = MAX_LOCAL_CREDENTIAL_LINES, max_candidates = MAX_LOCAL_CREDENTIAL_CANDIDATES, allow_decipher = 0)
+    content = read_text_file(file)
+    if content == null or content == "" then return 0
+
+    added = 0
+    line_number = 1
+    for line in content.split(NL)
+        if line_number > max_lines then break
+        if candidates.len >= max_candidates then return added
+
+        added = added + collect_password_candidates_from_line(crypto, candidates, seen, line, file.path + " [line " + line_number + "]", target_user, max_candidates, allow_decipher)
+        line_number = line_number + 1
+    end for
+
+    return added
+end function
+
+collect_password_candidates_from_folder = function(crypto, folder, candidates, seen, target_user, stats, depth = 0, max_depth = 2, allow_decipher = 0)
+    if folder == null then return
+    if not folder.is_folder then return
+    if not folder.has_permission("r") then return
+    if depth > max_depth then return
+    if stats.scanned_files >= stats.max_files then return
+    if candidates.len >= stats.max_candidates then return
+
+    files = folder.get_files
+    if files != null then
+        for file in files
+            if stats.scanned_files >= stats.max_files then return
+            if candidates.len >= stats.max_candidates then return
+            if file == null then continue
+
+            stats.scanned_files = stats.scanned_files + 1
+            stats.added = stats.added + collect_password_candidates_from_file(crypto, file, candidates, seen, target_user, stats.max_lines, stats.max_candidates, allow_decipher)
+        end for
+    end if
+
+    sub_folders = folder.get_folders
+    if sub_folders == null then return
+
+    for sub_folder in sub_folders
+        if stats.scanned_files >= stats.max_files then return
+        if candidates.len >= stats.max_candidates then return
+        collect_password_candidates_from_folder(crypto, sub_folder, candidates, seen, target_user, stats, depth + 1, max_depth, allow_decipher)
+    end for
+end function
+
+collect_local_structured_loot = function(crypto, candidate_seen, enable_decipher = 0)
+    outcome = {"scanned_files":0, "loot_records":0, "explicit_credentials":0}
+
+    passwd_file = computer.File("/etc/passwd")
+    passwd_content = read_text_file(passwd_file)
+    if passwd_content != null and passwd_content != "" then
+        outcome.scanned_files = outcome.scanned_files + 1
+
+        for line in passwd_content.split(NL)
+            user_line = normalize_text(line).trim
+            if user_line == "" then continue
+
+            user_parts = user_line.split(":")
+            if user_parts == null or user_parts.len < 2 then continue
+
+            user_name = normalize_text(user_parts[0]).trim
+            if user_name == "" then continue
+
+            secret_value = resolve_structured_secret(crypto, user_parts[1], enable_decipher)
+            outcome.loot_records = outcome.loot_records + push_local_loot_record(user_name, "passwd", user_name, secret_value, passwd_file.path, "local-harvest")
+            if secret_value != "" and secret_value.len >= 3 then
+                outcome.explicit_credentials = outcome.explicit_credentials + push_local_credential_record(user_name, secret_value, "local-passwd")
+                add_password_candidate_variants(crypto, globals.local_password_candidates, candidate_seen, secret_value, passwd_file.path + " [passwd:" + user_name + "]", enable_decipher)
+            end if
+        end for
+    end if
+
+    home_root = computer.File("/home")
+    if home_root == null or not home_root.is_folder or not home_root.has_permission("r") then return outcome
+
+    for user_dir in home_root.get_folders
+        if user_dir == null then continue
+
+        user_name = normalize_text(user_dir.name).trim
+        if user_name == "" then continue
+
+        for artifact in [{"type":"mail", "path":"/home/" + user_name + "/Config/Mail.txt"}, {"type":"bank", "path":"/home/" + user_name + "/Config/Bank.txt"}]
+            artifact_file = computer.File(artifact.path)
+            artifact_content = read_text_file(artifact_file)
+            if artifact_content == null or artifact_content == "" then continue
+
+            outcome.scanned_files = outcome.scanned_files + 1
+            first_line = ""
+            for line in artifact_content.split(NL)
+                first_line = normalize_text(line).trim
+                if first_line != "" then break
+            end for
+            if first_line == "" then continue
+
+            parts = first_line.split(":")
+            account_name = user_name
+            secret_value = ""
+            if parts != null and parts.len > 0 and normalize_text(parts[0]).trim != "" then account_name = normalize_text(parts[0]).trim
+            if parts != null and parts.len > 1 then secret_value = resolve_structured_secret(crypto, parts[1], enable_decipher)
+
+            outcome.loot_records = outcome.loot_records + push_local_loot_record(user_name, artifact.type, account_name, secret_value, artifact.path, "local-harvest")
+            if secret_value != "" then add_password_candidate_variants(crypto, globals.local_password_candidates, candidate_seen, secret_value, artifact.path + " [" + artifact.type + "]", enable_decipher)
+        end for
+    end for
+
+    return outcome
+end function
+
+harvest_local_credentials = function(enable_decipher = 0)
+    globals.local_credential_users = collect_local_credential_users()
+    globals.local_password_candidates = []
+    globals.local_credential_scanned_files = 0
+    globals.local_explicit_credentials = 0
+
+    crypto = null
+    if enable_decipher then crypto = load_preferred_lib("crypto.so")
+    candidate_seen = []
+    structured_outcome = collect_local_structured_loot(crypto, candidate_seen, enable_decipher)
+
+    stats = {"scanned_files":0, "added":0, "max_files":MAX_LOCAL_CREDENTIAL_FILES, "max_lines":MAX_LOCAL_CREDENTIAL_LINES, "max_candidates":MAX_LOCAL_CREDENTIAL_CANDIDATES}
+    stats.added = stats.added + collect_password_candidates_from_file(crypto, computer.File("/etc/passwd"), globals.local_password_candidates, candidate_seen, active_user, stats.max_lines, stats.max_candidates, 0)
+    stats.added = stats.added + collect_password_candidates_from_file(crypto, computer.File("/etc/shadow"), globals.local_password_candidates, candidate_seen, active_user, stats.max_lines, stats.max_candidates, 0)
+
+    for root_path in local_credential_scan_roots
+        max_depth = 1
+        if root_path == "/home" then max_depth = 2
+        if root_path == "/server" then max_depth = 2
+        collect_password_candidates_from_folder(crypto, computer.File(root_path), globals.local_password_candidates, candidate_seen, active_user, stats, 0, max_depth, 0)
+    end for
+
+    globals.local_credential_scanned_files = stats.scanned_files + structured_outcome.scanned_files
+    globals.local_explicit_credentials = structured_outcome.explicit_credentials
+
+    result = {}
+    result.decipher_enabled = enable_decipher
+    result.crypto_available = crypto != null
+    result.users = globals.local_credential_users.len
+    result.password_candidates = globals.local_password_candidates.len
+    result.loot_records = structured_outcome.loot_records
+    result.explicit_credentials = structured_outcome.explicit_credentials
+    result.scanned_files = globals.local_credential_scanned_files
+    return result
+end function
+
+credential_matches_current_host = function(credential_entry)
+    if credential_entry == null then return 0
+
+    if credential_entry.host_public != "" then
+        if credential_entry.host_public == computer.public_ip then return 1
+        if credential_entry.host_public == computer.local_ip then return 1
+    end if
+
+    if credential_entry.host_local != "" then
+        if credential_entry.host_local == computer.local_ip then return 1
+        if credential_entry.host_local == computer.public_ip then return 1
+    end if
+
+    return 0
+end function
+
+parse_loot_cache = function(path)
+    f = computer.File(path)
+    if not f then return
+    if f.is_binary then return
+    if not f.has_permission("r") then return
+
+    content = f.get_content
+    if content == null or content.len == 0 then return
+
+    lines = content.replace(CR, "").split(NL)
+    if lines.len < 2 then return
+
+    for line in lines[1:]
+        if line.len == 0 then continue
+
+        parts = line.split(TAB)
+        if parts.len < 8 then continue
+        if parts[0] == "host_public" and parts[1] == "host_local" then continue
+
+        entry = {}
+        entry.host_public = parts[0]
+        entry.host_local = parts[1]
+        entry.user = parts[2]
+        entry.artifact_type = parts[3]
+        entry.account = parts[4]
+        entry.secret = parts[5]
+        entry.source = parts[6]
+        entry.notes = parts[7]
+        globals.service_loot.push(entry)
+    end for
+end function
+
+parse_credential_cache = function(path)
+    f = computer.File(path)
+    if not f then return
+    if f.is_binary then return
+    if not f.has_permission("r") then return
+
+    content = f.get_content
+    if content == null or content.len == 0 then return
+
+    lines = content.replace(CR, "").split(NL)
+    if lines.len < 2 then return
+
+    for line in lines[1:]
+        if line.len == 0 then continue
+
+        parts = line.split(TAB)
+        if parts.len < 5 then continue
+        if parts[0] == "host_public" and parts[1] == "host_local" then continue
+
+        entry = {}
+        entry.host_public = parts[0]
+        entry.host_local = parts[1]
+        entry.user = parts[2]
+        entry.password = parts[3]
+        entry.source = parts[4]
+        globals.credential_cache.push(entry)
+    end for
+end function
+
+scan_file = function(f)
+    globals.file_count = globals.file_count + 1
+
+    if not f then return
+    if f.is_folder then return
+    if f.is_binary then return
+    if not f.has_permission("r") then return
+
+    content = f.get_content
+    if content == null or content.len == 0 then return
+
+    kw = find_keyword(content)
+    if kw == null then return
+
+    globals.hit_count = globals.hit_count + 1
+    print("")
+    print("[HIT " + globals.hit_count + "] " + f.path + " | keyword=" + kw)
+    print("owner=" + f.owner + " group=" + f.group + " perms=" + f.permissions + " size=" + f.size)
+    print("preview=" + safe_preview(content, 220))
+end function
+
+walk = function(path, depth=0)
+    if depth > 2 then return
+    if globals.visited_dirs.hasIndex(path) then return
+    globals.visited_dirs[path] = 1
+
+    f = computer.File(path)
+    if not f then return
+
+    if not f.is_folder then
+        scan_file(f)
+        return
+    end if
+
+    if not f.has_permission("r") then return
+
+    globals.dir_count = globals.dir_count + 1
+
+    items = f.get_folders + f.get_files
+    for item in items
+        if item.is_folder then
+            walk(item.path, depth + 1)
+        else
+            scan_file(item)
+        end if
+    end for
+end function
+
+load_preferred_lib = function(file_name)
+    built_in_lib = include_lib("/lib/" + file_name)
+    if built_in_lib then return built_in_lib
+
+    home_lib = include_lib(join_path(home, file_name))
+    if home_lib then return home_lib
+
+    current_path_lib = include_lib(join_path(current_path, file_name))
+    if current_path_lib then return current_path_lib
+
+    return null
+end function
+
+build_host_addresses = function(host_record)
+    addresses = []
+    seen_addresses = {}
+
+    if host_record == null then return addresses
+
+    if host_record.public_ip != "" and computer.public_ip != "" and host_record.public_ip == computer.public_ip then
+        push_unique_path(addresses, seen_addresses, host_record.lan_ip)
+    end if
+
+    push_unique_path(addresses, seen_addresses, host_record.public_ip)
+    push_unique_path(addresses, seen_addresses, host_record.lan_ip)
+    push_unique_path(addresses, seen_addresses, host_record.ip)
+    return addresses
+end function
+
+is_same_host_record = function(host_record)
+    if host_record == null then return 0
+
+    current_public_ip = computer.public_ip
+    current_local_ip = computer.local_ip
+
+    if host_record.public_ip != "" and current_public_ip != "" and host_record.public_ip != current_public_ip then return 0
+    if host_record.lan_ip != "" and current_local_ip != "" and host_record.lan_ip != current_local_ip then return 0
+
+    if host_record.lan_ip != "" and current_local_ip != "" and host_record.lan_ip == current_local_ip then return 1
+    if host_record.ip != "" and current_local_ip != "" and host_record.ip == current_local_ip then return 1
+    if host_record.public_ip != "" and current_public_ip != "" and host_record.public_ip == current_public_ip then return 1
+    return 0
+end function
+
+list_readable_user_homes = function(remote_computer)
+    readable_users = []
+    if remote_computer == null then return readable_users
+
+    home_root = remote_computer.File("/home")
+    if not home_root then return readable_users
+    if not home_root.is_folder then return readable_users
+    if not home_root.has_permission("r") then return readable_users
+
+    for user_dir in home_root.get_folders
+        if user_dir == null then continue
+        if user_dir.has_permission("r") then readable_users.push(user_dir.name)
+    end for
+
+    return readable_users
+end function
+
+classify_access_level = function(remote_computer)
+    if remote_computer == null then return "none"
+
+    shadow_file = remote_computer.File("/etc/shadow")
+    if shadow_file and not shadow_file.is_folder and shadow_file.has_permission("r") then return "root"
+
+    root_dir = remote_computer.File("/root")
+    if root_dir and root_dir.is_folder and root_dir.has_permission("r") then return "root"
+
+    readable_users = list_readable_user_homes(remote_computer)
+    if readable_users.len == 0 then return "guest"
+
+    for readable_user in readable_users
+        if readable_user.lower != "guest" then return "user"
+    end for
+
+    return "guest"
+end function
+
+login_access_type = function(access_object)
+    lowered = typeof(access_object).lower
+    if lowered == "shell" then return "shell"
+    if lowered.indexOf("ftp") != null then return "ftp"
+    return lowered
+end function
+
+credential_matches_host = function(credential_entry, host_record)
+    if credential_entry == null or host_record == null then return 0
+
+    if credential_entry.host_public != "" then
+        if host_record.public_ip == credential_entry.host_public then return 1
+        if host_record.ip == credential_entry.host_public then return 1
+    end if
+
+    if credential_entry.host_local != "" then
+        if host_record.lan_ip == credential_entry.host_local then return 1
+        if host_record.ip == credential_entry.host_local then return 1
+    end if
+
+    return 0
+end function
+
+find_host_record_for_surface = function(surface_entry)
+    for host_record in globals.host_cache
+        if surface_entry.host_ip != "" and host_record.ip == surface_entry.host_ip then return host_record
+        if surface_entry.host_public != "" and host_record.public_ip == surface_entry.host_public then return host_record
+        if surface_entry.host_local != "" and host_record.lan_ip == surface_entry.host_local then return host_record
+    end for
+
+    return null
+end function
+
+find_signature_hint = function(surface_entry)
+    for signature_entry in globals.signature_cache
+        if signature_entry.lib != surface_entry.lib then continue
+        if signature_entry.version != surface_entry.version then continue
+        if signature_entry.port != surface_entry.port then continue
+        if signature_entry.memory != surface_entry.memory then continue
+        if signature_entry.unsafe != surface_entry.unsafe then continue
+        return signature_entry
+    end for
+
+    return null
+end function
+
+resolve_surface_attack_address = function(surface_entry)
+    port_number = to_number_or_default(surface_entry.port, -1)
+    if port_number == 0 and surface_entry.host_public != "" then return surface_entry.host_public
+    if surface_entry.host_ip != "" then return surface_entry.host_ip
+    if surface_entry.host_local != "" then return surface_entry.host_local
+    return surface_entry.host_public
+end function
+
+list_folder_items = function(folder_file)
+    items = []
+    if folder_file == null then return items
+    if not folder_file.is_folder then return items
+
+    folders = folder_file.get_folders
+    files = folder_file.get_files
+
+    if folders != null then
+        for folder_item in folders
+            if folder_item != null then items.push(folder_item)
+        end for
+    end if
+
+    if files != null then
+        for file_item in files
+            if file_item != null then items.push(file_item)
+        end for
+    end if
+
+    return items
+end function
+
+format_open_remote_ports = function(remote_computer)
+    if remote_computer == null then return "none"
+
+    ports = remote_computer.get_ports
+    if ports == null or ports.len == 0 then return "none"
+
+    parts = []
+    for port_obj in ports
+        if port_obj == null then continue
+        if port_obj.is_closed then continue
+        parts.push("" + port_obj.port_number)
+    end for
+
+    if parts.len == 0 then return "none"
+    return parts.join(",")
+end function
+
+describe_remote_computer = function(remote_computer, indent="    ")
+    if remote_computer == null then return
+
+    print(indent + "host=" + remote_computer.get_name + " | local=" + remote_computer.local_ip + " | public=" + remote_computer.public_ip + " | access=" + classify_access_level(remote_computer))
+    print(indent + "open_ports=" + format_open_remote_ports(remote_computer))
+
+    readable_users = list_readable_user_homes(remote_computer)
+    if readable_users.len == 0 then
+        print(indent + "readable_users=(none)")
+    else
+        print(indent + "readable_users=" + readable_users.join(", "))
+    end if
+
+    passwd_file = remote_computer.File("/etc/passwd")
+    if passwd_file and not passwd_file.is_folder and not passwd_file.is_binary and passwd_file.has_permission("r") then
+        print(indent + "passwd_preview=" + safe_preview(passwd_file.get_content, 180))
+    end if
+end function
+
+describe_file_result = function(file_result, indent="    ")
+    if file_result == null then return
+
+    file_type = "file"
+    if file_result.is_folder then file_type = "folder"
+
+    print(indent + "path=" + file_result.path + " | type=" + file_type + " | perms=" + file_result.permissions + " | owner=" + file_result.owner + ":" + file_result.group)
+    print(indent + "access=r:" + file_result.has_permission("r") + " w:" + file_result.has_permission("w") + " x:" + file_result.has_permission("x"))
+
+    if file_result.is_folder then
+        if not file_result.has_permission("r") then
+            print(indent + "listing=(permission denied)")
+            return
+        end if
+
+        items = list_folder_items(file_result)
+        if items.len == 0 then
+            print(indent + "listing=(empty)")
+            return
+        end if
+
+        shown = 0
+        for item in items
+            print(indent + "- " + item.name + " | " + item.permissions + " | " + item.owner + ":" + item.group)
+            shown = shown + 1
+            if shown >= 8 then
+                print(indent + "... truncated ...")
+                break
+            end if
+        end for
+        return
+    end if
+
+    if file_result.is_binary then
+        print(indent + "preview=(binary)")
+        return
+    end if
+
+    if not file_result.has_permission("r") then
+        print(indent + "preview=(permission denied)")
+        return
+    end if
+
+    content = file_result.get_content
+    print(indent + "preview=" + safe_preview(content, 220))
+    keyword_hit = find_keyword(content)
+    if keyword_hit != null then print(indent + "keyword=" + keyword_hit)
+end function
+
+run_exploit = function()
+    print("=== EXPLOIT ===")
+    print("host=" + computer.get_name + " | local=" + computer.local_ip + " | public=" + computer.public_ip)
+    print("network_active=" + computer.is_network_active)
+
+    artifacts = discover_crs_artifacts
+    load_crs_artifact_data(artifacts)
+    local_intel = harvest_local_credentials(1)
+    print_crs_artifact_locations(artifacts)
+
+    print("")
+    print("Loaded caches:")
+    print("  hosts=" + globals.host_cache.len)
+    print("  credentials=" + globals.credential_cache.len)
+    print("  signatures=" + globals.signature_cache.len)
+    print("  surface_records=" + globals.surface_cache.len)
+    print("  loot_records=" + globals.service_loot.len)
+
+    print("")
+    print("Local credential intel:")
+    print("  users=" + local_intel.users)
+    print("  password_candidates=" + local_intel.password_candidates)
+    print("  explicit_local_creds=" + local_intel.explicit_credentials)
+    print("  scanned_files=" + local_intel.scanned_files)
+    if local_intel.decipher_enabled and not local_intel.crypto_available then print("  crypto=unavailable (decipher skipped)")
+
+    print("")
+    print("Credential replay:")
+    credential_attempts = 0
+    credential_hits = 0
+    credential_try_keys = {}
+
+    for credential_entry in globals.credential_cache
+        if credential_attempts >= MAX_CREDENTIAL_REPLAY_ATTEMPTS then break
+        if not credential_matches_current_host(credential_entry) then continue
+
+        local_try_key = "local" + TAB + credential_entry.user + TAB + credential_entry.password
+        if credential_try_keys.hasIndex(local_try_key) then continue
+
+        credential_try_keys[local_try_key] = 1
+        credential_attempts = credential_attempts + 1
+        local_shell = get_shell(credential_entry.user, credential_entry.password)
+        if local_shell then
+            credential_hits = credential_hits + 1
+            print("  [HIT] local shell | user=" + credential_entry.user + " | level=" + classify_access_level(local_shell.host_computer) + " | source=" + credential_entry.source)
+        end if
+    end for
+
+    if globals.local_credential_users.len > 0 and globals.local_password_candidates.len > 0 then
+        for user_name in globals.local_credential_users
+            if credential_attempts >= MAX_CREDENTIAL_REPLAY_ATTEMPTS then break
+
+            for password_candidate in globals.local_password_candidates
+                if credential_attempts >= MAX_CREDENTIAL_REPLAY_ATTEMPTS then break
+
+                candidate_try_key = "candidate" + TAB + user_name + TAB + password_candidate.value
+                if credential_try_keys.hasIndex(candidate_try_key) then continue
+
+                credential_try_keys[candidate_try_key] = 1
+                credential_attempts = credential_attempts + 1
+                candidate_shell = get_shell(user_name, password_candidate.value)
+                if candidate_shell then
+                    credential_hits = credential_hits + 1
+                    print("  [HIT] local candidate | user=" + user_name + " | level=" + classify_access_level(candidate_shell.host_computer) + " | source=" + password_candidate.source)
+                end if
+            end for
+        end for
+    end if
+
+    if globals.host_cache.len > 0 and globals.credential_cache.len > 0 then
+        for host_record in globals.host_cache
+            if credential_attempts >= MAX_CREDENTIAL_REPLAY_ATTEMPTS then break
+            if is_same_host_record(host_record) then continue
+
+            for credential_entry in globals.credential_cache
+                if credential_attempts >= MAX_CREDENTIAL_REPLAY_ATTEMPTS then break
+                if not credential_matches_host(credential_entry, host_record) then continue
+
+                if has_open_port(host_record, 22) then
+                    if not computer.is_network_active then continue
+                    for address in build_host_addresses(host_record)
+                        if credential_attempts >= MAX_CREDENTIAL_REPLAY_ATTEMPTS then break
+
+                        ssh_try_key = "ssh" + TAB + address + TAB + credential_entry.user + TAB + credential_entry.password
+                        if credential_try_keys.hasIndex(ssh_try_key) then continue
+
+                        credential_try_keys[ssh_try_key] = 1
+                        credential_attempts = credential_attempts + 1
+                        ssh_connection = shell.connect_service(address, 22, credential_entry.user, credential_entry.password, "ssh")
+                        if login_access_type(ssh_connection) == "shell" then
+                            credential_hits = credential_hits + 1
+                            print("  [HIT] ssh " + address + ":22 | user=" + credential_entry.user + " | level=" + classify_access_level(ssh_connection.host_computer) + " | source=" + credential_entry.source)
+                        end if
+                    end for
+                end if
+
+                if has_open_port(host_record, 21) then
+                    if not computer.is_network_active then continue
+                    for address in build_host_addresses(host_record)
+                        if credential_attempts >= MAX_CREDENTIAL_REPLAY_ATTEMPTS then break
+
+                        ftp_try_key = "ftp" + TAB + address + TAB + credential_entry.user + TAB + credential_entry.password
+                        if credential_try_keys.hasIndex(ftp_try_key) then continue
+
+                        credential_try_keys[ftp_try_key] = 1
+                        credential_attempts = credential_attempts + 1
+                        ftp_connection = shell.connect_service(address, 21, credential_entry.user, credential_entry.password, "ftp")
+                        if login_access_type(ftp_connection) == "ftp" then
+                            credential_hits = credential_hits + 1
+                            print("  [HIT] ftp " + address + ":21 | user=" + credential_entry.user + " | level=" + classify_access_level(ftp_connection.host_computer) + " | source=" + credential_entry.source)
+                        end if
+                    end for
+                end if
+            end for
+        end for
+    end if
+
+    if credential_attempts == 0 then
+        print("(no local or cached credential replay candidates were usable)")
+    else
+        print("  attempts=" + credential_attempts + " | hits=" + credential_hits)
+    end if
+
+    print("")
+    print("Overflow replay:")
+    if not computer.is_network_active then
+        print("(network inactive, remote overflow replay skipped)")
+        return
+    end if
+
+    meta = load_preferred_lib("metaxploit.so")
+    if meta == null then
+        print("(metaxploit library unavailable)")
+        return
+    end if
+
+    if globals.surface_cache.len == 0 then
+        print("(no surface cache records)")
+        return
+    end if
+
+    overflow_attempts = 0
+    overflow_hits = 0
+    overflow_try_keys = {}
+
+    for surface_entry in globals.surface_cache
+        if overflow_attempts >= MAX_OVERFLOW_REPLAY_ATTEMPTS then break
+
+        attack_address = resolve_surface_attack_address(surface_entry)
+        port_number = to_number_or_default(surface_entry.port, -1)
+        if attack_address == "" then continue
+        if port_number < 0 then continue
+
+        overflow_try_key = attack_address + TAB + surface_entry.port + TAB + surface_entry.memory + TAB + surface_entry.unsafe
+        if overflow_try_keys.hasIndex(overflow_try_key) then continue
+        overflow_try_keys[overflow_try_key] = 1
+        overflow_attempts = overflow_attempts + 1
+
+        if port_number == 0 then
+            session = meta.net_use(attack_address)
+        else
+            session = meta.net_use(attack_address, port_number)
+        end if
+
+        if session == null then continue
+        remote_lib = session.dump_lib
+        if remote_lib == null then continue
+
+        remote_lib_name = remote_lib.lib_name
+        remote_lib_version = remote_lib.version
+        if surface_entry.lib != "" and remote_lib_name != surface_entry.lib then continue
+        if surface_entry.version != "" and remote_lib_version != surface_entry.version then continue
+
+        result = remote_lib.overflow(surface_entry.memory, surface_entry.unsafe)
+        if result == null then continue
+
+        result_type = typeof(result)
+        overflow_hits = overflow_hits + 1
+        signature_hint = find_signature_hint(surface_entry)
+        expected_type = ""
+        if signature_hint != null then expected_type = signature_hint.result_type
+
+        host_record = find_host_record_for_surface(surface_entry)
+        host_label = attack_address
+        if host_record != null and host_record.role != "" then host_label = host_label + " (" + host_record.role + ")"
+
+        print("  [HIT] " + host_label + " | port=" + surface_entry.port + " | lib=" + remote_lib_name + " v" + remote_lib_version + " | mem=" + surface_entry.memory + " | unsafe=" + surface_entry.unsafe + " | result=" + result_type)
+        if expected_type != "" then print("    expected=" + expected_type)
+        if result_type == "shell" or result_type == "ftp" then
+            print("    level=" + classify_access_level(result.host_computer))
+            describe_remote_computer(result.host_computer)
+        end if
+        if result_type == "computer" then
+            print("    level=" + classify_access_level(result))
+            describe_remote_computer(result)
+        end if
+        if result_type == "file" then describe_file_result(result)
+        if result_type == "string" then print("    value=" + safe_preview(result, 220))
+        if result_type == "number" then print("    value=" + result)
+    end for
+
+    if overflow_attempts == 0 then
+        print("(no overflow replay attempts were possible)")
+    else
+        print("  attempts=" + overflow_attempts + " | hits=" + overflow_hits)
+    end if
+end function
+
+run_audit = function()
+    print("=== AUDIT ===")
+    print("user=" + active_user)
+    print("cwd=" + current_path)
+    print("host=" + computer.get_name)
+    print("local_ip=" + computer.local_ip)
+    print("public_ip=" + computer.public_ip)
+    print("network_active=" + computer.is_network_active)
+
+    print("")
+    print("=== PROCESSES ===")
+    print(computer.show_procs)
+
+    print("")
+    print("=== LOCAL PORTS ===")
+    router = null
+    if computer.is_network_active then
+        router = get_router
+    else
+        print("Network inactive, router lookup skipped")
+    end if
+
+    ports = computer.get_ports
+    if ports == null or ports.len == 0 then
+        print("(none)")
+    else
+        for port in ports
+            if router then
+                print("  " + port.port_number + " -> " + router.port_info(port))
+            else
+                print("  " + port.port_number)
+            end if
+        end for
+    end if
+
+    for p in audit_paths
+        inspect_path(p)
+    end for
+end function
+
+run_pivot = function()
+    print("=== PIVOT ===")
+    print("host=" + computer.get_name + " | local=" + computer.local_ip + " | public=" + computer.public_ip)
+
+    collect_local_users
+    print("")
+    print("Visible local users:")
+    if globals.local_users.len == 0 then
+        print("(none)")
+    else
+        for u in globals.local_users
+            print("  " + u.name + " | perms=" + u.perms + " | access r=" + u.can_read + " w=" + u.can_write + " x=" + u.can_exec)
+        end for
+    end if
+
+    artifacts = discover_crs_artifacts
+    load_crs_artifact_data(artifacts)
+    local_intel = harvest_local_credentials(0)
+    print_crs_artifact_locations(artifacts)
+
+    print("")
+    print("Structured CRS caches:")
+    print("  hosts=" + globals.host_cache.len)
+    print("  credentials=" + globals.credential_cache.len)
+    print("  signatures=" + globals.signature_cache.len)
+    print("  surface_records=" + globals.surface_cache.len)
+    print("  loot_records=" + globals.service_loot.len)
+
+    print("")
+    print("Local credential intel:")
+    print("  users=" + local_intel.users)
+    print("  password_candidates=" + local_intel.password_candidates)
+    print("  explicit_local_creds=" + local_intel.explicit_credentials)
+    print("  scanned_files=" + local_intel.scanned_files)
+    if not local_intel.decipher_enabled then
+        print("  crypto=disabled for fast local scan")
+    else if not local_intel.crypto_available then
+        print("  crypto=unavailable (decipher skipped)")
+    end if
+
+    print("")
+    print("Local login users:")
+    if globals.local_credential_users.len == 0 then
+        print("(none)")
+    else
+        shown_login_users = 0
+        for user_name in globals.local_credential_users
+            print("  " + user_name)
+            shown_login_users = shown_login_users + 1
+            if shown_login_users >= 12 then
+                print("  ... truncated ...")
+                break
+            end if
+        end for
+    end if
+
+    print("")
+    print("Local password candidates:")
+    if globals.local_password_candidates.len == 0 then
+        print("(none)")
+    else
+        shown_candidates = 0
+        for candidate in globals.local_password_candidates
+            print("  " + candidate.value + " | source=" + candidate.source)
+            shown_candidates = shown_candidates + 1
+            if shown_candidates >= 10 then
+                print("  ... truncated ...")
+                break
+            end if
+        end for
+    end if
+
+    print("")
+    print("Structured service loot:")
+    if globals.service_loot.len == 0 then
+        print("(none)")
+    else
+        for e in globals.service_loot
+            print("  user=" + e.user + " | type=" + e.artifact_type + " | account=" + e.account + " | secret=" + e.secret)
+            print("    source=" + e.source)
+            if e.notes.len > 0 then print("    notes=" + e.notes)
+        end for
+    end if
+
+    print("")
+    print("Structured credential cache:")
+    if globals.credential_cache.len == 0 then
+        print("(none)")
+    else
+        for e in globals.credential_cache
+            print("  user=" + e.user + " | password=" + e.password + " | source=" + e.source)
+        end for
+    end if
+
+    print("")
+    print("Ranked host cache:")
+    if globals.host_cache.len == 0 then
+        print("(none)")
+    else
+        shown_hosts = 0
+        for host_record in globals.host_cache
+            print("  " + host_record.ip + " | role=" + host_record.role + " | priority=" + host_record.priority + " | score=" + host_record.score + " | ports=" + host_record.ports_text)
+            shown_hosts = shown_hosts + 1
+            if shown_hosts >= 8 then
+                print("  ... truncated ...")
+                break
+            end if
+        end for
+    end if
+
+    print("")
+    print("Exploit surface cache:")
+    if globals.surface_cache.len == 0 then
+        print("(none)")
+    else
+        shown_surface = 0
+        for surface_entry in globals.surface_cache
+            print("  " + surface_entry.host_ip + ":" + surface_entry.port + " | " + surface_entry.lib + " v" + surface_entry.version + " | mem=" + surface_entry.memory + " | unsafe=" + surface_entry.unsafe)
+            shown_surface = shown_surface + 1
+            if shown_surface >= 8 then
+                print("  ... truncated ...")
+                break
+            end if
+        end for
+    end if
+
+    report_file = artifacts.report_file
+    print("")
+    print("CRS report preview:")
+    if report_file and not report_file.is_binary and report_file.has_permission("r") then
+        print(safe_preview(report_file.get_content, 260))
+    else
+        print("(not readable)")
+    end if
+
+    print("")
+    print("Recommended manual pivots:")
+    if globals.service_loot.len == 0 and globals.credential_cache.len == 0 then
+        print("  - No structured pivot data found yet.")
+    else
+        for e in globals.service_loot
+            print("  - Service cred -> user=" + e.user + " | type=" + e.artifact_type + " | account=" + e.account + " | secret=" + e.secret)
+        end for
+        for e in globals.credential_cache
+            print("  - Host cred candidate -> user=" + e.user + " | password=" + e.password)
+        end for
+    end if
+    print("  - Treat mail/bank secrets as service creds first, not guaranteed OS passwords.")
+    print("  - Next host-only lane is readable /server + local service surface.")
+end function
+
+run_loot = function()
+    print("=== LOOT ===")
+    print("user=" + active_user)
+    print("cwd=" + current_path)
+    print("host=" + computer.get_name)
+
+    globals.visited_dirs = {}
+    globals.hit_count = 0
+    globals.file_count = 0
+    globals.dir_count = 0
+
+    for root in scan_roots
+        print("")
+        print("Scanning root: " + root)
+        walk(root, 0)
+    end for
+
+    print("")
+    print("=== SUMMARY ===")
+    print("dirs_scanned=" + globals.dir_count)
+    print("files_scanned=" + globals.file_count)
+    print("hits=" + globals.hit_count)
+end function
+
+if mode == "audit" then
+    run_audit
+else if mode == "pivot" then
+    run_pivot
+else if mode == "loot" then
+    run_loot
+else if mode == "exploit" or mode == "attack" then
+    run_exploit
+else if mode == "all" then
+    run_audit
+    print("")
+    print("========================================")
+    print("")
+    run_pivot
+    print("")
+    print("========================================")
+    print("")
+    run_loot
+else
+    exit("Usage: guest_recon_pivot_v1 [audit|pivot|loot|exploit|attack|all] [optional_crs_output_dir]")
+end if

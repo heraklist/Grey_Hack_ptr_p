@@ -1,0 +1,489 @@
+// Grey Hack LAN mapper suite
+// Safe inventory only: router, hosts, ports, service index.
+
+NL = char(10)
+TAB = char(9)
+
+appendLine = function(lines, text)
+  lines.push(text)
+end function
+
+isError = function(value)
+  return value isa string and value != ""
+end function
+
+normalizeInput = function(value)
+  if value == null then return ""
+  return str(value)
+end function
+
+listHasValue = function(items, wanted)
+  if items == null then return 0
+
+  for item in items
+    if item == wanted then return 1
+  end for
+
+  return 0
+end function
+
+ensureFolder = function(computer, parentPath, folderName)
+  folderPath = parentPath + "/" + folderName
+  folder = computer.File(folderPath)
+  if folder != null then return folderPath
+
+  created = computer.create_folder(parentPath, folderName)
+  if created == 1 then return folderPath
+
+  return null
+end function
+
+ensureTextFile = function(computer, dirPath, fileName)
+  filePath = dirPath + "/" + fileName
+  file = computer.File(filePath)
+  if file != null then return file
+
+  created = computer.touch(dirPath, fileName)
+  if isError(created) then return null
+
+  return computer.File(filePath)
+end function
+
+splitIpParts = function(ipAddress)
+  ipText = normalizeInput(ipAddress)
+  if ipText == "" then return []
+
+  parts = []
+  current = ""
+
+  for ch in ipText
+    if ch == "." then
+      parts.push(current)
+      current = ""
+    else
+      current = current + ch
+    end if
+  end for
+
+  parts.push(current)
+  return parts
+end function
+
+isLikelyRouterIp = function(ipAddress)
+  parts = splitIpParts(ipAddress)
+  if parts == null or parts.len != 4 then return 0
+  return parts[3] == "1"
+end function
+
+subnetKey = function(ipAddress)
+  parts = splitIpParts(ipAddress)
+  if parts == null or parts.len != 4 then return normalizeInput(ipAddress)
+  return parts[0] + "." + parts[1] + "." + parts[2] + ".x"
+end function
+
+serviceName = function(portNumber)
+  if portNumber == 0 then return "router-kernel"
+  if portNumber == 21 then return "ftp"
+  if portNumber == 22 then return "ssh"
+  if portNumber == 25 then return "smtp"
+  if portNumber == 80 then return "http"
+  if portNumber == 141 then return "bank-sql"
+  if portNumber == 443 then return "https"
+  if portNumber == 3306 then return "sql"
+  if portNumber == 8080 then return "router-http"
+  if portNumber == 1222 then return "rshell"
+  if portNumber == 1542 then return "repository"
+  if portNumber == 1883 then return "smart-appliance"
+  if portNumber == 5555 then return "adb"
+  return "unknown"
+end function
+
+serviceWeight = function(portNumber)
+  if portNumber == 21 then return 3
+  if portNumber == 22 then return 3
+  if portNumber == 25 then return 3
+  if portNumber == 80 then return 4
+  if portNumber == 141 then return 5
+  if portNumber == 443 then return 4
+  if portNumber == 3306 then return 5
+  if portNumber == 8080 then return 3
+  if portNumber == 1222 then return 4
+  if portNumber == 1542 then return 4
+  if portNumber == 1883 then return 2
+  if portNumber == 5555 then return 4
+  return 1
+end function
+
+hostRoleGuess = function(ipAddress, openPorts)
+  if isLikelyRouterIp(ipAddress) then
+    if openPorts == null or openPorts.len == 0 then return "adjacent-gateway"
+    return "gateway"
+  end if
+
+  if openPorts == null or openPorts.len == 0 then return "host"
+
+  for portInfo in openPorts
+    if portInfo.port == 3306 or portInfo.port == 141 then return "data-server"
+    if portInfo.port == 80 or portInfo.port == 443 or portInfo.port == 8080 then return "web-server"
+    if portInfo.port == 25 then return "mail-server"
+    if portInfo.port == 1883 then return "iot-device"
+    if portInfo.port == 1542 then return "repository-server"
+  end for
+
+  return "host"
+end function
+
+collectOpenPorts = function(router, ipAddress)
+  openPorts = []
+  if router == null then return openPorts
+
+  ports = router.device_ports(ipAddress)
+  if ports == null then return openPorts
+
+  for portObj in ports
+    if portObj == null then continue
+    if portObj.is_closed then continue
+
+    openPorts.push({
+      "port": portObj.port_number,
+      "service": serviceName(portObj.port_number),
+    })
+  end for
+
+  return openPorts
+end function
+
+formatOpenPorts = function(openPorts)
+  if openPorts == null or openPorts.len == 0 then return "none"
+
+  parts = []
+  for portInfo in openPorts
+    parts.push(portInfo.port + " (" + portInfo.service + ")")
+  end for
+
+  return parts.join(", ")
+end function
+
+formatPortNumbers = function(openPorts)
+  if openPorts == null or openPorts.len == 0 then return "none"
+
+  parts = []
+  for portInfo in openPorts
+    if portInfo == null then continue
+    parts.push("" + portInfo.port)
+  end for
+
+  if parts.len == 0 then return "none"
+  return parts.join(",")
+end function
+
+scoreHost = function(ipAddress, openPorts)
+  score = 0
+  if isLikelyRouterIp(ipAddress) then score = score + 1
+  if openPorts == null then return score
+
+  for portInfo in openPorts
+    score = score + serviceWeight(portInfo.port)
+  end for
+
+  return score
+end function
+
+priorityLabel = function(score)
+  if score >= 8 then return "high"
+  if score >= 4 then return "medium"
+  return "low"
+end function
+
+findSubnetRecord = function(subnetRecords, subnetName)
+  if subnetRecords == null then return null
+
+  for subnetRecord in subnetRecords
+    if subnetRecord.name == subnetName then return subnetRecord
+  end for
+
+  return null
+end function
+
+buildLanHostList = function(router)
+  hosts = []
+  if router == null then return hosts
+
+  if router.local_ip != "" and not listHasValue(hosts, router.local_ip) then
+    hosts.push(router.local_ip)
+  end if
+
+  lanIps = router.devices_lan_ip
+  if lanIps == null then return hosts
+
+  for lanIp in lanIps
+    if not listHasValue(hosts, lanIp) then hosts.push(lanIp)
+  end for
+
+  return hosts
+end function
+
+buildPublicServiceList = function(router)
+  publicServices = []
+  if router == null then return publicServices
+
+  usedPorts = router.used_ports
+  if usedPorts == null then return publicServices
+
+  for portObj in usedPorts
+    if portObj == null then continue
+    if portObj.is_closed then continue
+
+    publicServices.push({
+      "port": portObj.port_number,
+      "service": serviceName(portObj.port_number),
+    })
+  end for
+
+  return publicServices
+end function
+
+findServiceRecord = function(serviceRecords, serviceKey)
+  if serviceRecords == null then return null
+
+  for serviceRecord in serviceRecords
+    if serviceRecord.name == serviceKey then return serviceRecord
+  end for
+
+  return null
+end function
+
+recordServiceIndex = function(reportLines, hostsData)
+  serviceRecords = []
+
+  for hostData in hostsData
+    for portInfo in hostData.open_ports
+      serviceKey = portInfo.service
+      serviceRecord = findServiceRecord(serviceRecords, serviceKey)
+      if serviceRecord == null then
+        serviceRecord = {
+          "name": serviceKey,
+          "addresses": [],
+        }
+        serviceRecords.push(serviceRecord)
+      end if
+
+      serviceRecord.addresses.push(hostData.ip + ":" + portInfo.port)
+    end for
+  end for
+
+  appendLine(reportLines, "Service Index")
+  appendLine(reportLines, "-------------")
+
+  if serviceRecords.len == 0 then
+    appendLine(reportLines, "No open services indexed.")
+    appendLine(reportLines, "")
+    return
+  end if
+
+  for serviceRecord in serviceRecords
+    appendLine(reportLines, serviceRecord.name + ": " + serviceRecord.addresses.join(", "))
+  end for
+
+  appendLine(reportLines, "")
+end function
+
+recordSubnetSummary = function(reportLines, hostsData)
+  subnetRecords = []
+
+  for hostData in hostsData
+    subnetName = subnetKey(hostData.ip)
+    subnetRecord = findSubnetRecord(subnetRecords, subnetName)
+    if subnetRecord == null then
+      subnetRecord = {
+        "name": subnetName,
+        "hosts": [],
+        "active_hosts": 0,
+      }
+      subnetRecords.push(subnetRecord)
+    end if
+
+    subnetRecord.hosts.push(hostData.ip)
+    if hostData.open_ports.len > 0 then subnetRecord.active_hosts = subnetRecord.active_hosts + 1
+  end for
+
+  appendLine(reportLines, "Subnet Summary")
+  appendLine(reportLines, "--------------")
+
+  for subnetRecord in subnetRecords
+    appendLine(reportLines, subnetRecord.name + " -> hosts=" + subnetRecord.hosts.len + ", active=" + subnetRecord.active_hosts)
+  end for
+
+  appendLine(reportLines, "")
+end function
+
+recordHighValueTargets = function(reportLines, hostsData)
+  appendLine(reportLines, "High-Value Targets")
+  appendLine(reportLines, "------------------")
+
+  found = 0
+  for hostData in hostsData
+    if hostData.open_ports.len == 0 then continue
+    if priorityLabel(hostData.score) != "high" then continue
+
+    found = 1
+    appendLine(reportLines, hostData.ip + " | " + hostData.role + " | " + formatOpenPorts(hostData.open_ports))
+  end for
+
+  if not found then appendLine(reportLines, "No high-value targets identified.")
+  appendLine(reportLines, "")
+end function
+
+recordCategorySummary = function(reportLines, hostsData)
+  gatewayCount = 0
+  adjacentGatewayCount = 0
+  serverCount = 0
+  clientCount = 0
+  quietCount = 0
+
+  for hostData in hostsData
+    if hostData.open_ports.len == 0 then quietCount = quietCount + 1
+
+    if hostData.role == "gateway" then
+      gatewayCount = gatewayCount + 1
+      continue
+    end if
+
+    if hostData.role == "adjacent-gateway" then
+      adjacentGatewayCount = adjacentGatewayCount + 1
+      continue
+    end if
+
+    if hostData.role == "data-server" or hostData.role == "web-server" or hostData.role == "mail-server" or hostData.role == "repository-server" then
+      serverCount = serverCount + 1
+      continue
+    end if
+
+    clientCount = clientCount + 1
+  end for
+
+  appendLine(reportLines, "Category Summary")
+  appendLine(reportLines, "----------------")
+  appendLine(reportLines, "Gateways: " + gatewayCount)
+  appendLine(reportLines, "Adjacent gateways: " + adjacentGatewayCount)
+  appendLine(reportLines, "Servers: " + serverCount)
+  appendLine(reportLines, "Clients: " + clientCount)
+  appendLine(reportLines, "Quiet hosts: " + quietCount)
+  appendLine(reportLines, "")
+end function
+
+shell = get_shell
+if shell == null then exit("Could not access current shell")
+
+computer = shell.host_computer
+if computer == null then exit("Could not access host computer")
+
+router = get_router
+if router == null then exit("No current router found")
+
+reportDir = ensureFolder(computer, home_dir, "loot")
+if reportDir == null then reportDir = home_dir
+
+reportFile = ensureTextFile(computer, reportDir, "lan_mapper_report.txt")
+if reportFile == null then exit("Unable to create LAN mapper report")
+
+hostFile = ensureTextFile(computer, reportDir, "lan_mapper_hosts.txt")
+if hostFile == null then exit("Unable to create LAN mapper host list")
+
+hostTsvFile = ensureTextFile(computer, reportDir, "lan_mapper_hosts.tsv")
+if hostTsvFile == null then exit("Unable to create LAN mapper host tsv")
+
+reportLines = []
+hostLines = []
+hostTsvLines = []
+hostsData = []
+
+appendLine(reportLines, "Grey Hack LAN Mapper Report")
+appendLine(reportLines, "Date: " + current_date)
+appendLine(reportLines, "User: " + active_user)
+appendLine(reportLines, "Current host public IP: " + computer.public_ip)
+appendLine(reportLines, "Current host local IP: " + computer.local_ip)
+appendLine(reportLines, "")
+
+appendLine(reportLines, "Router Summary")
+appendLine(reportLines, "--------------")
+appendLine(reportLines, "Router ESSID: " + router.essid_name)
+appendLine(reportLines, "Router BSSID: " + router.bssid_name)
+appendLine(reportLines, "Router public IP: " + router.public_ip)
+appendLine(reportLines, "Router local IP: " + router.local_ip)
+appendLine(reportLines, "")
+
+publicServices = buildPublicServiceList(router)
+appendLine(reportLines, "Public Services")
+appendLine(reportLines, "---------------")
+if publicServices.len == 0 then
+  appendLine(reportLines, "None visible")
+else
+  for portInfo in publicServices
+    appendLine(reportLines, portInfo.port + " (" + portInfo.service + ")")
+  end for
+end if
+appendLine(reportLines, "")
+
+lanHosts = buildLanHostList(router)
+appendLine(reportLines, "LAN Host Count: " + lanHosts.len)
+appendLine(reportLines, "")
+
+appendLine(hostLines, "Grey Hack LAN Mapper Hosts")
+appendLine(hostLines, "Router public IP: " + router.public_ip)
+appendLine(hostLines, "Router local IP: " + router.local_ip)
+appendLine(hostLines, "")
+
+appendLine(hostTsvLines, "ip" + TAB + "role" + TAB + "priority" + TAB + "score" + TAB + "ports")
+
+for lanIp in lanHosts
+  openPorts = collectOpenPorts(router, lanIp)
+  role = hostRoleGuess(lanIp, openPorts)
+  score = scoreHost(lanIp, openPorts)
+  priority = priorityLabel(score)
+
+  hostData = {
+    "ip": lanIp,
+    "role": role,
+    "score": score,
+    "priority": priority,
+    "open_ports": openPorts,
+  }
+  hostsData.push(hostData)
+
+  appendLine(reportLines, "Host: " + lanIp)
+  appendLine(reportLines, "Role: " + role)
+  appendLine(reportLines, "Interest score: " + score)
+  appendLine(reportLines, "Priority: " + priority)
+  appendLine(reportLines, "Subnet: " + subnetKey(lanIp))
+  appendLine(reportLines, "Open ports: " + formatOpenPorts(openPorts))
+  appendLine(reportLines, "")
+
+  appendLine(hostLines, lanIp + " | " + role + " | priority=" + priority + " | score=" + score + " | " + formatOpenPorts(openPorts))
+  appendLine(hostTsvLines, lanIp + TAB + role + TAB + priority + TAB + score + TAB + formatPortNumbers(openPorts))
+end for
+
+recordCategorySummary(reportLines, hostsData)
+recordSubnetSummary(reportLines, hostsData)
+recordHighValueTargets(reportLines, hostsData)
+recordServiceIndex(reportLines, hostsData)
+
+appendLine(reportLines, "Inspection Order")
+appendLine(reportLines, "----------------")
+for hostData in hostsData
+  appendLine(reportLines, hostData.ip + " -> " + hostData.priority + " priority")
+end for
+
+saveReportResult = reportFile.set_content(reportLines.join(NL))
+if isError(saveReportResult) then exit("Failed to save LAN mapper report: " + saveReportResult)
+
+saveHostResult = hostFile.set_content(hostLines.join(NL))
+if isError(saveHostResult) then exit("Failed to save LAN mapper host list: " + saveHostResult)
+
+saveHostTsvResult = hostTsvFile.set_content(hostTsvLines.join(NL))
+if isError(saveHostTsvResult) then exit("Failed to save LAN mapper host tsv: " + saveHostTsvResult)
+
+print("LAN mapper report saved to " + reportFile.path)
+print("Host list saved to " + hostFile.path)
+print("Host TSV saved to " + hostTsvFile.path)
+print("LAN hosts mapped: " + lanHosts.len)

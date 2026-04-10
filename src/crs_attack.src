@@ -1,0 +1,697 @@
+// CRS attack module
+// Exploit surface parsing, manual assist, attack queueing, and target attack execution.
+
+// CRS module 40: attack engine and main runtime entry flow. Import last.
+
+buildAttackPortTargets = function(targetRecord)
+  ports = []
+  seen = []
+  if targetRecord == null then return ports
+
+  roleText = normalizeInput(targetRecord.role).trim.lower
+  if roleText.indexOf("gateway") != null then
+    seen.push("0")
+    ports.push(0)
+  end if
+
+  if targetRecord.open_ports == null then return ports
+
+  for portInfo in targetRecord.open_ports
+    if portInfo == null then continue
+    portNumber = portInfo.port
+    portKey = "" + portNumber
+    if listHasValue(seen, portKey) then continue
+    seen.push(portKey)
+    ports.push(portNumber)
+  end for
+
+  return ports
+end function
+
+runOverflow = function(metaLib, portNumber, routerLanIp, memoryAddress, unsafeValue)
+  return metaLib.overflow(memoryAddress, unsafeValue)
+end function
+
+resolveRouterPivotLanIp = function(runState, targetRecord)
+  if runState != null and runState.target != null then
+    targetLanIp = normalizeInput(runState.target.target_lan_ip).trim
+    if targetLanIp != "" then return targetLanIp
+  end if
+
+  return ""
+end function
+
+buildOverflowVariants = function(runState, targetRecord, portNumber)
+  variants = []
+  if portNumber != 0 then
+    variants.push({"label":"default", "extra_arg":""})
+    return variants
+  end if
+
+  variants.push({"label":"router-self", "extra_arg":""})
+  pivotLanIp = resolveRouterPivotLanIp(runState, targetRecord)
+  if pivotLanIp != "" then variants.push({"label":"lan-pivot", "extra_arg":pivotLanIp})
+  return variants
+end function
+
+buildOverflowTryKey = function(memoryAddress, unsafeValue, variantLabel, extraArg = "")
+  return normalizeInput(memoryAddress).trim + TAB + normalizeInput(unsafeValue).trim + TAB + normalizeCacheField(variantLabel) + TAB + normalizeCacheField(extraArg)
+end function
+
+runOverflowVariant = function(metaLib, memoryAddress, unsafeValue, extraArg = "")
+  extraText = normalizeInput(extraArg).trim
+  if extraText != "" then return metaLib.overflow(memoryAddress, unsafeValue, extraText)
+  return metaLib.overflow(memoryAddress, unsafeValue)
+end function
+
+classifyAttackStatus = function(resultType, resultValue = null)
+  if resultType == "shell" then return "shell"
+  if resultType == "computer" then return "computer"
+  if resultType == "file" then return "file"
+  if resultType == "number" then
+    if resultValue == 1 then return "numeric-hit"
+    return "numeric-nohit"
+  end if
+  if resultType == "string" then
+    cleanText = normalizeInput(resultValue).trim
+    if cleanText == "" then return "string-empty"
+    return "string-hit"
+  end if
+  if resultType == "" then return "no-hit"
+  return "other-hit"
+end function
+
+isAcceptedAttackResult = function(resultType, resultValue = null)
+  statusText = classifyAttackStatus(resultType, resultValue)
+  if statusText == "shell" then return 1
+  return 0
+end function
+
+resolveAttackAddress = function(targetRecord, portNumber)
+  if targetRecord == null then return ""
+
+  if portNumber == 0 then
+    publicIp = normalizeInput(targetRecord.public_ip).trim
+    if publicIp != "" then return publicIp
+  end if
+
+  return normalizeInput(targetRecord.ip).trim
+end function
+
+printAttackSummary = function(attackResult)
+  if attackResult == null then return
+
+  print("CRS V1 attack summary")
+  print("Status: " + formatValueDisplay(attackResult.status))
+  print("Target: " + formatValueDisplay(attackResult.target_ip))
+  print("Ports tried: " + formatValueDisplay(attackResult.ports_tried_text))
+  print("Sessions opened: " + attackResult.sessions_opened)
+  print("Overflow attempts: " + attackResult.overflow_attempts)
+  print("Memory zones seen: " + attackResult.memory_zones)
+  print("Library: " + formatValueDisplay(attackResult.lib_name) + " v" + formatValueDisplay(attackResult.lib_version))
+  print("Exploit result type: " + formatValueDisplay(attackResult.raw_result_type))
+  print("Result type: " + formatValueDisplay(attackResult.result_type))
+  print("Escalation status: " + formatValueDisplay(attackResult.escalation_status))
+  if normalizeInput(attackResult.manual_assist_status).trim != "" then print("Manual assist: " + attackResult.manual_assist_status)
+  if normalizeInput(attackResult.manual_assist_port).trim != "" then print("Manual port: " + attackResult.manual_assist_port)
+  if normalizeInput(attackResult.manual_assist_memory).trim != "" then print("Manual memory: " + attackResult.manual_assist_memory)
+  if normalizeInput(attackResult.manual_assist_unsafe).trim != "" then print("Manual unsafe: " + attackResult.manual_assist_unsafe)
+  if attackResult.success_port != "" then print("Success port: " + attackResult.success_port)
+  if attackResult.success_memory != "" then print("Success memory: " + attackResult.success_memory)
+  if attackResult.success_unsafe != "" then print("Success unsafe: " + attackResult.success_unsafe)
+  print("")
+end function
+
+buildAttackQueue = function(rankedHosts, selectedHostRecord, runState = null)
+  queue = []
+  seen = []
+
+  preferredEntryRecord = null
+  if runState != null and selectedHostRecord != null then
+    if isExactTargetHost(runState, selectedHostRecord) then
+      preferredEntryRecord = findPreferredEntryHostRecord(rankedHosts, runState.target)
+    end if
+  end if
+
+  if preferredEntryRecord != null then
+    addUniqueHostRecord(queue, seen, preferredEntryRecord)
+  end if
+
+  if selectedHostRecord != null then
+    addUniqueHostRecord(queue, seen, selectedHostRecord)
+  end if
+
+  if rankedHosts == null then return queue
+
+  for hostRecord in rankedHosts
+    addUniqueHostRecord(queue, seen, hostRecord)
+  end for
+
+  return queue
+end function
+
+shouldPromptBeforeNextHost = function(runState, hostRecord, remainingCount)
+  if runState == null then return 0
+  if runState.config == null then return 0
+  if runState.config.non_interactive then return 0
+  if remainingCount <= 0 then return 0
+  if hostRecord == null then return 0
+
+  roleText = normalizeInput(hostRecord.role).trim.lower
+  if roleText.indexOf("gateway") != null then return 0
+  return 1
+end function
+
+isExactTargetShellResult = function(runState, hostRecord, attackResult)
+  if runState == null then return 0
+  if hostRecord == null then return 0
+  if attackResult == null then return 0
+
+  exactTargetRecord = findExactTargetHostRecord(runState.ranked_hosts, runState.target)
+  if exactTargetRecord == null then return 0
+  if normalizeInput(exactTargetRecord.ip).trim != normalizeInput(hostRecord.ip).trim then return 0
+
+  rawType = normalizeInput(attackResult.raw_result_type).trim.lower
+  resultType = normalizeInput(attackResult.result_type).trim.lower
+  statusText = normalizeInput(attackResult.status).trim.lower
+
+  if rawType == "shell" then return 1
+  if resultType == "shell" then return 1
+  if statusText == "root-shell" or statusText == "persistence-shell" or statusText == "final-shell" then return 1
+  return 0
+end function
+
+confirmContinueAfterShell = function(runState, hostRecord, remainingCount)
+  if not shouldPromptBeforeNextHost(runState, hostRecord, remainingCount) then return 0
+
+  promptText = "Shell obtained on " + normalizeInput(hostRecord.ip).trim + " (" + normalizeInput(hostRecord.role).trim + "). Continue to next host? [y/N]: "
+  answer = normalizeInput(user_input(promptText)).trim.lower
+  return toYesNoFlag(answer, 0)
+end function
+
+attackRankedTargets = function(rankedHosts, selectedHostRecord, runtimeContext, runState)
+  queue = buildAttackQueue(rankedHosts, selectedHostRecord, runState)
+  bestResult = null
+  bestPriority = -1
+  queueIndex = -1
+
+  for hostRecord in queue
+    yield
+    queueIndex = queueIndex + 1
+    if hostRecord == null then continue
+    markVisitedHost(runState, hostRecord.ip)
+
+    currentResult = attackTarget(hostRecord, runtimeContext, runState)
+    if currentResult == null then continue
+
+    currentPriority = 0
+    if currentResult.status == "computer" then currentPriority = 3
+    if currentResult.status == "final-shell" or currentResult.status == "root-shell" or currentResult.status == "persistence-shell" then currentPriority = 5
+    if currentResult.result != null and isAcceptedAttackResult(currentResult.raw_result_type, currentResult.result) then currentPriority = 4
+    if currentResult.result != null and currentPriority == 0 then currentPriority = 2
+    if currentResult.status != "no-hit" and currentPriority == 0 then currentPriority = 1
+
+    if currentPriority > bestPriority then
+      bestPriority = currentPriority
+      bestResult = currentResult
+    end if
+
+    printAttackSummary(currentResult)
+    if isExactTargetShellResult(runState, hostRecord, currentResult) then
+      appendLine(currentResult.notes, "Exact target shell obtained; stopping lateral movement and keeping focus on same-host escalation.")
+      return currentResult
+    end if
+
+    if hasRecordedShellAccess(runState) then
+      remainingCount = queue.len - queueIndex - 1
+      hasShellResult = 0
+      if currentResult.raw_result_type == "shell" then hasShellResult = 1
+      if currentResult.result_type == "shell" then hasShellResult = 1
+      if currentResult.status == "root-shell" or currentResult.status == "persistence-shell" or currentResult.status == "final-shell" then hasShellResult = 1
+
+      if hasShellResult and confirmContinueAfterShell(runState, hostRecord, remainingCount) then
+        continue
+      end if
+
+      if hasShellResult then return currentResult
+      continue
+    end if
+  end for
+
+  if bestResult != null then return bestResult
+  return {
+    "status": "no-hit",
+    "result": null,
+    "raw_result_type": "",
+    "result_type": "",
+    "escalation_status": "",
+    "manual_assist_status": "",
+    "manual_assist_port": "",
+    "manual_assist_memory": "",
+    "manual_assist_unsafe": "",
+    "target_ip": "",
+    "ports_tried": [],
+    "ports_tried_text": "",
+    "sessions_opened": 0,
+    "overflow_attempts": 0,
+    "memory_zones": 0,
+    "surface_records": 0,
+    "lib_name": "",
+    "lib_version": "",
+    "success_port": "",
+    "success_memory": "",
+    "success_unsafe": "",
+    "notes": [],
+  }
+end function
+
+attackTarget = function(targetRecord, runtimeContext, runState)
+  outcome = {
+    "status": "not-run",
+    "result": null,
+    "raw_result_type": "",
+    "result_type": "",
+    "escalation_status": "",
+    "manual_assist_status": "",
+    "manual_assist_port": "",
+    "manual_assist_memory": "",
+    "manual_assist_unsafe": "",
+    "target_ip": "",
+    "ports_tried": [],
+    "ports_tried_text": "",
+    "sessions_opened": 0,
+    "overflow_attempts": 0,
+    "memory_zones": 0,
+    "surface_records": 0,
+    "lib_name": "",
+    "lib_version": "",
+    "success_port": "",
+    "success_memory": "",
+    "success_unsafe": "",
+    "notes": [],
+  }
+
+  if targetRecord == null then
+    outcome.status = "no-target"
+    return outcome
+  end if
+
+  outcome.target_ip = normalizeInput(targetRecord.ip).trim
+
+  if runtimeContext.meta == null then
+    outcome.status = "missing-metaxploit"
+    appendLine(outcome.notes, "Metaxploit library is not loaded.")
+    return outcome
+  end if
+
+  targetPorts = buildAttackPortTargets(targetRecord)
+  if targetPorts.len == 0 then
+    outcome.status = "no-ports"
+    appendLine(outcome.notes, "No attackable ports were discovered for the selected host.")
+    return outcome
+  end if
+
+  signatureCache = runState.signature_cache
+  triedSignatures = []
+  maxAttempts = 120
+  exactTargetMode = isExactTargetHost(runState, targetRecord)
+  fastShellOnly = 0
+  if runState != null and runState.config != null and runState.config.fast_shell_only then fastShellOnly = 1
+  fallbackComputerResult = null
+  fallbackComputerPort = ""
+  fallbackComputerMemory = ""
+  fallbackComputerUnsafe = ""
+  fallbackComputerEscalationStatus = ""
+  fallbackFileResult = null
+  fallbackFileStatus = ""
+  fallbackFilePriority = -1
+  fallbackFilePort = ""
+  fallbackFileMemory = ""
+  fallbackFileUnsafe = ""
+  fallbackShellResult = null
+  fallbackShellResultType = ""
+  fallbackShellStatus = ""
+  fallbackShellAccessLevel = ""
+  fallbackShellPort = ""
+  fallbackShellMemory = ""
+  fallbackShellUnsafe = ""
+
+  for portNumber in targetPorts
+    yield
+    attackAddress = resolveAttackAddress(targetRecord, portNumber)
+    if attackAddress == "" then continue
+    outcome.ports_tried.push("" + portNumber)
+
+    if portNumber == 0 then
+      session = runtimeContext.meta.net_use(attackAddress)
+    else
+      session = runtimeContext.meta.net_use(attackAddress, portNumber)
+    end if
+
+    if session == null then
+      appendLine(outcome.notes, "Session failed on " + attackAddress + ":" + portNumber)
+      continue
+    end if
+
+    outcome.sessions_opened = outcome.sessions_opened + 1
+    appendLine(outcome.notes, "Session opened on " + attackAddress + ":" + portNumber)
+
+    remoteLib = session.dump_lib
+    if remoteLib == null then
+      appendLine(outcome.notes, "Library dump failed on " + attackAddress + ":" + portNumber)
+      continue
+    end if
+
+    outcome.lib_name = normalizeInput(remoteLib.lib_name).trim
+    outcome.lib_version = normalizeInput(remoteLib.version).trim
+    appendLine(outcome.notes, "Library " + outcome.lib_name + " v" + outcome.lib_version)
+
+    cachedSignatures = findCachedSignatures(signatureCache, outcome.lib_name, outcome.lib_version, portNumber)
+    for cachedEntry in cachedSignatures
+      yield
+      if outcome.overflow_attempts >= maxAttempts then
+        outcome.status = "attempt-limit"
+        appendLine(outcome.notes, "Attack attempt limit reached while replaying cached signatures.")
+        outcome.ports_tried_text = outcome.ports_tried.join(", ")
+        return outcome
+      end if
+
+      overflowVariants = buildOverflowVariants(runState, targetRecord, portNumber)
+      for overflowVariant in overflowVariants
+        yield
+        if outcome.overflow_attempts >= maxAttempts then
+          outcome.status = "attempt-limit"
+          appendLine(outcome.notes, "Attack attempt limit reached while replaying cached signatures.")
+          outcome.ports_tried_text = outcome.ports_tried.join(", ")
+          return outcome
+        end if
+
+        variantLabel = normalizeInput(overflowVariant.label).trim
+        variantExtraArg = normalizeInput(overflowVariant.extra_arg).trim
+        cachedTryKey = buildOverflowTryKey(cachedEntry.memory, cachedEntry.unsafe, variantLabel, variantExtraArg)
+        if listHasValue(triedSignatures, cachedTryKey) then continue
+
+        triedSignatures.push(cachedTryKey)
+        outcome.overflow_attempts = outcome.overflow_attempts + 1
+        result = runOverflowVariant(remoteLib, cachedEntry.memory, cachedEntry.unsafe, variantExtraArg)
+        if result == null then continue
+
+        resultType = typeof(result)
+        addSignatureCacheRecord(signatureCache, outcome.lib_name, outcome.lib_version, portNumber, cachedEntry.memory, cachedEntry.unsafe, resultType)
+        outcome.result = result
+        outcome.raw_result_type = resultType
+        outcome.result_type = resultType
+        outcome.status = classifyAttackStatus(resultType, result)
+        outcome.success_port = "" + portNumber
+        outcome.success_memory = normalizeInput(cachedEntry.memory).trim
+        outcome.success_unsafe = normalizeInput(cachedEntry.unsafe).trim
+        appendLine(outcome.notes, "Cached signature hit [" + variantLabel + "]: " + cachedEntry.memory + " / " + cachedEntry.unsafe + " -> " + resultType)
+        if variantExtraArg != "" then appendLine(outcome.notes, "Overflow extra arg: " + variantExtraArg)
+        if resultType == "string" then appendLine(outcome.notes, "Result value: " + normalizeInput(result))
+        if resultType == "number" then appendLine(outcome.notes, "Result value: " + result)
+
+        if resultType == "shell" then
+          recordAcceptedTerminalAccess(result, targetRecord, runState)
+          accessLevel = classifyTerminalAccessLevel(result, runState.target.target_user)
+          if exactTargetMode and fastShellOnly then
+            appendLine(outcome.notes, "Fast-shell-only mode active; keeping first usable exact-target shell.")
+            outcome.ports_tried_text = outcome.ports_tried.join(", ")
+            return outcome
+          end if
+          if exactTargetMode and accessLevel != "root" then
+            if fallbackShellResult == null or accessLevelScore(accessLevel) > accessLevelScore(fallbackShellAccessLevel) then
+              fallbackShellResult = result
+              fallbackShellResultType = resultType
+              fallbackShellStatus = classifyAttackStatus(resultType, result)
+              fallbackShellAccessLevel = accessLevel
+              fallbackShellPort = "" + portNumber
+              fallbackShellMemory = normalizeInput(cachedEntry.memory).trim
+              fallbackShellUnsafe = normalizeInput(cachedEntry.unsafe).trim
+            end if
+            appendLine(outcome.notes, "Exact target " + accessLevel + " shell obtained; continuing same-host exploit search for stronger access.")
+            continue
+          end if
+        end if
+
+        if resultType == "computer" then
+          escalationOutcome = attemptComputerShellEscalation(runtimeContext.shell, result, targetRecord, runState)
+          outcome.escalation_status = escalationOutcome.status
+          for noteLine in escalationOutcome.notes
+            appendLine(outcome.notes, noteLine)
+          end for
+
+          if escalationOutcome.shell != null then
+            outcome.result = escalationOutcome.shell
+            outcome.result_type = escalationOutcome.access_type
+            outcome.status = escalationOutcome.status
+            outcome.ports_tried_text = outcome.ports_tried.join(", ")
+            return outcome
+          end if
+
+          if fallbackComputerResult == null then
+            fallbackComputerResult = result
+            fallbackComputerPort = "" + portNumber
+            fallbackComputerMemory = normalizeInput(cachedEntry.memory).trim
+            fallbackComputerUnsafe = normalizeInput(cachedEntry.unsafe).trim
+            fallbackComputerEscalationStatus = escalationOutcome.status
+          end if
+          appendLine(outcome.notes, "Computer access preserved; continuing exploit search for direct shell.")
+          continue
+        end if
+
+        if resultType == "file" then
+          fileOutcome = handleFileAttackResult(runtimeContext, runState, targetRecord, result, variantExtraArg)
+          outcome.status = fileOutcome.status
+          filePriority = scoreFileAttackOutcome(fileOutcome)
+          for noteLine in fileOutcome.notes
+            appendLine(outcome.notes, noteLine)
+          end for
+          if filePriority > fallbackFilePriority then
+            fallbackFileResult = result
+            fallbackFileStatus = fileOutcome.status
+            fallbackFilePriority = filePriority
+            fallbackFilePort = "" + portNumber
+            fallbackFileMemory = normalizeInput(cachedEntry.memory).trim
+            fallbackFileUnsafe = normalizeInput(cachedEntry.unsafe).trim
+          end if
+          appendLine(outcome.notes, "File access preserved; continuing exploit search for shell/computer.")
+          continue
+        end if
+
+        if isAcceptedAttackResult(resultType, result) then
+          outcome.ports_tried_text = outcome.ports_tried.join(", ")
+          return outcome
+        end if
+      end for
+    end for
+
+    memories = runtimeContext.meta.scan(remoteLib)
+    if memories == null or memories.len == 0 then
+      appendLine(outcome.notes, "No vulnerable memory zones found on " + attackAddress + ":" + portNumber)
+      continue
+    end if
+
+    outcome.memory_zones = outcome.memory_zones + memories.len
+    appendLine(outcome.notes, "Memory zones on " + attackAddress + ":" + portNumber + ": " + memories.len)
+
+    for memoryAddress in memories
+      yield
+      scanInfo = runtimeContext.meta.scan_address(remoteLib, memoryAddress)
+      outcome.surface_records = outcome.surface_records + dumpExploitSurface(targetRecord, runtimeContext, runState, portNumber, remoteLib, memoryAddress, scanInfo, "remote-service")
+      unsafeValues = extractUnsafeValues(scanInfo)
+      if unsafeValues == null or unsafeValues.len == 0 then continue
+
+      for unsafeValue in unsafeValues
+        yield
+        if outcome.overflow_attempts >= maxAttempts then
+          outcome.status = "attempt-limit"
+          appendLine(outcome.notes, "Attack attempt limit reached while testing discovered unsafe values.")
+          outcome.ports_tried_text = outcome.ports_tried.join(", ")
+          return outcome
+        end if
+
+        overflowVariants = buildOverflowVariants(runState, targetRecord, portNumber)
+        for overflowVariant in overflowVariants
+          yield
+          if outcome.overflow_attempts >= maxAttempts then
+            outcome.status = "attempt-limit"
+            appendLine(outcome.notes, "Attack attempt limit reached while testing discovered unsafe values.")
+            outcome.ports_tried_text = outcome.ports_tried.join(", ")
+            return outcome
+          end if
+
+          variantLabel = normalizeInput(overflowVariant.label).trim
+          variantExtraArg = normalizeInput(overflowVariant.extra_arg).trim
+          tryKey = buildOverflowTryKey(memoryAddress, unsafeValue, variantLabel, variantExtraArg)
+          if listHasValue(triedSignatures, tryKey) then continue
+
+          triedSignatures.push(tryKey)
+          outcome.overflow_attempts = outcome.overflow_attempts + 1
+          result = runOverflowVariant(remoteLib, memoryAddress, unsafeValue, variantExtraArg)
+          if result == null then continue
+
+          resultType = typeof(result)
+          addSignatureCacheRecord(signatureCache, outcome.lib_name, outcome.lib_version, portNumber, memoryAddress, unsafeValue, resultType)
+          outcome.result = result
+          outcome.raw_result_type = resultType
+          outcome.result_type = resultType
+          outcome.status = classifyAttackStatus(resultType, result)
+          outcome.success_port = "" + portNumber
+          outcome.success_memory = normalizeInput(memoryAddress).trim
+          outcome.success_unsafe = normalizeInput(unsafeValue).trim
+          appendLine(outcome.notes, "Exploit hit [" + variantLabel + "]: " + memoryAddress + " / " + unsafeValue + " -> " + resultType)
+          if variantExtraArg != "" then appendLine(outcome.notes, "Overflow extra arg: " + variantExtraArg)
+          if resultType == "string" then appendLine(outcome.notes, "Result value: " + normalizeInput(result))
+          if resultType == "number" then appendLine(outcome.notes, "Result value: " + result)
+
+          if resultType == "shell" then
+            recordAcceptedTerminalAccess(result, targetRecord, runState)
+            accessLevel = classifyTerminalAccessLevel(result, runState.target.target_user)
+            if exactTargetMode and fastShellOnly then
+              appendLine(outcome.notes, "Fast-shell-only mode active; keeping first usable exact-target shell.")
+              outcome.ports_tried_text = outcome.ports_tried.join(", ")
+              return outcome
+            end if
+            if exactTargetMode and accessLevel != "root" then
+              if fallbackShellResult == null or accessLevelScore(accessLevel) > accessLevelScore(fallbackShellAccessLevel) then
+                fallbackShellResult = result
+                fallbackShellResultType = resultType
+                fallbackShellStatus = classifyAttackStatus(resultType, result)
+                fallbackShellAccessLevel = accessLevel
+                fallbackShellPort = "" + portNumber
+                fallbackShellMemory = normalizeInput(memoryAddress).trim
+                fallbackShellUnsafe = normalizeInput(unsafeValue).trim
+              end if
+              appendLine(outcome.notes, "Exact target " + accessLevel + " shell obtained; continuing same-host exploit search for stronger access.")
+              continue
+            end if
+          end if
+
+          if resultType == "computer" then
+            escalationOutcome = attemptComputerShellEscalation(runtimeContext.shell, result, targetRecord, runState)
+            outcome.escalation_status = escalationOutcome.status
+            for noteLine in escalationOutcome.notes
+              appendLine(outcome.notes, noteLine)
+            end for
+
+            if escalationOutcome.shell != null then
+              outcome.result = escalationOutcome.shell
+              outcome.result_type = escalationOutcome.access_type
+              outcome.status = escalationOutcome.status
+              outcome.ports_tried_text = outcome.ports_tried.join(", ")
+              return outcome
+            end if
+
+            if fallbackComputerResult == null then
+              fallbackComputerResult = result
+              fallbackComputerPort = "" + portNumber
+              fallbackComputerMemory = normalizeInput(memoryAddress).trim
+              fallbackComputerUnsafe = normalizeInput(unsafeValue).trim
+              fallbackComputerEscalationStatus = escalationOutcome.status
+            end if
+            appendLine(outcome.notes, "Computer access preserved; continuing exploit search for direct shell.")
+            continue
+          end if
+
+          if resultType == "file" then
+            fileOutcome = handleFileAttackResult(runtimeContext, runState, targetRecord, result, variantExtraArg)
+            outcome.status = fileOutcome.status
+            filePriority = scoreFileAttackOutcome(fileOutcome)
+            for noteLine in fileOutcome.notes
+              appendLine(outcome.notes, noteLine)
+            end for
+            if filePriority > fallbackFilePriority then
+              fallbackFileResult = result
+              fallbackFileStatus = fileOutcome.status
+              fallbackFilePriority = filePriority
+              fallbackFilePort = "" + portNumber
+              fallbackFileMemory = normalizeInput(memoryAddress).trim
+              fallbackFileUnsafe = normalizeInput(unsafeValue).trim
+            end if
+            appendLine(outcome.notes, "File access preserved; continuing exploit search for shell/computer.")
+            continue
+          end if
+
+          if isAcceptedAttackResult(resultType, result) then
+            outcome.ports_tried_text = outcome.ports_tried.join(", ")
+            return outcome
+          end if
+        end for
+      end for
+    end for
+  end for
+
+  if fallbackShellResult != null then
+    outcome.status = fallbackShellStatus
+    outcome.result = fallbackShellResult
+    outcome.raw_result_type = fallbackShellResultType
+    outcome.result_type = fallbackShellResultType
+    outcome.success_port = fallbackShellPort
+    outcome.success_memory = fallbackShellMemory
+    outcome.success_unsafe = fallbackShellUnsafe
+    outcome.ports_tried_text = outcome.ports_tried.join(", ")
+    return outcome
+  end if
+
+  manualAssistOutcome = manualExploitAssist(targetRecord, runtimeContext, runState)
+  if manualAssistOutcome != null then
+    outcome.manual_assist_status = normalizeInput(manualAssistOutcome.status).trim
+    outcome.manual_assist_port = normalizeInput(manualAssistOutcome.selected_port).trim
+    outcome.manual_assist_memory = normalizeInput(manualAssistOutcome.selected_memory).trim
+    outcome.manual_assist_unsafe = normalizeInput(manualAssistOutcome.selected_unsafe).trim
+    if outcome.manual_assist_port != "" and not listHasValue(outcome.ports_tried, outcome.manual_assist_port) then outcome.ports_tried.push(outcome.manual_assist_port)
+    outcome.sessions_opened = outcome.sessions_opened + manualAssistOutcome.sessions_opened
+    outcome.overflow_attempts = outcome.overflow_attempts + manualAssistOutcome.overflow_attempts
+    for noteLine in manualAssistOutcome.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+
+    if manualAssistOutcome.keep_result and manualAssistOutcome.result != null then
+      outcome.status = manualAssistOutcome.status
+      outcome.result = manualAssistOutcome.result
+      outcome.raw_result_type = manualAssistOutcome.raw_result_type
+      outcome.result_type = manualAssistOutcome.result_type
+      outcome.escalation_status = manualAssistOutcome.escalation_status
+      outcome.success_port = normalizeInput(manualAssistOutcome.selected_port).trim
+      outcome.success_memory = normalizeInput(manualAssistOutcome.selected_memory).trim
+      outcome.success_unsafe = normalizeInput(manualAssistOutcome.selected_unsafe).trim
+      outcome.ports_tried_text = outcome.ports_tried.join(", ")
+      return outcome
+    end if
+  end if
+
+  if fallbackComputerResult != null then
+    outcome.status = "computer"
+    outcome.result = fallbackComputerResult
+    outcome.raw_result_type = "computer"
+    outcome.result_type = "computer"
+    outcome.escalation_status = fallbackComputerEscalationStatus
+    outcome.success_port = fallbackComputerPort
+    outcome.success_memory = fallbackComputerMemory
+    outcome.success_unsafe = fallbackComputerUnsafe
+    outcome.ports_tried_text = outcome.ports_tried.join(", ")
+    return outcome
+  end if
+
+  if fallbackFileResult != null then
+    outcome.status = fallbackFileStatus
+    outcome.result = fallbackFileResult
+    outcome.raw_result_type = "file"
+    outcome.result_type = "file"
+    outcome.success_port = fallbackFilePort
+    outcome.success_memory = fallbackFileMemory
+    outcome.success_unsafe = fallbackFileUnsafe
+    outcome.ports_tried_text = outcome.ports_tried.join(", ")
+    return outcome
+  end if
+
+  if outcome.result != null then
+    outcome.ports_tried_text = outcome.ports_tried.join(", ")
+    return outcome
+  end if
+
+  outcome.status = "no-hit"
+  outcome.ports_tried_text = outcome.ports_tried.join(", ")
+  return outcome
+end function
+

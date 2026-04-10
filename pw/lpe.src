@@ -1,0 +1,157 @@
+// ==========================================================
+// LPE WORKER v1.3 (Hybrid IPC + Status File)
+// Runs ON the victim machine
+// ==========================================================
+
+metaxploit = include_lib("/lib/metaxploit.so")
+if not metaxploit then
+    metaxploit = include_lib(current_path + "/metaxploit.so")
+end if
+if not metaxploit then exit
+
+ipc = get_custom_object()
+shell = get_shell
+if not shell then exit
+comp = shell.host_computer
+if not comp then exit
+
+status_path = "/tmp/lpe.status"
+target_libs = ["/lib/init.so", "/lib/kernel_module.so", "/lib/net.so"]
+
+
+// ------------------------------
+// Helpers
+// ------------------------------
+
+trim_ws = function(s)
+    if s == null then return ""
+    while s.len > 0 and (s[0] == " " or s[0] == "\t" or s[0] == "\r")
+        s = s[1:]
+    end while
+    while s.len > 0 and (s[s.len - 1] == " " or s[s.len - 1] == "\t" or s[s.len - 1] == "\r")
+        s = s[:s.len - 1]
+    end while
+    return s
+end function
+
+add_unique = function(lst, value)
+    value = trim_ws(value)
+    if value == "" then return
+    for item in lst
+        if item == value then return
+    end for
+    lst.push(value)
+end function
+
+write_status = function(msg)
+    ipc.lpe_status = msg
+
+    f = comp.File(status_path)
+    if not f then
+        t = comp.touch("/tmp", "lpe.status")
+        if t != true and t != 1 and t then
+            // ignore and continue
+        end if
+        f = comp.File(status_path)
+    end if
+
+    if f then
+        w = f.set_content(msg)
+        if typeof(w) == "string" and w != "" then
+            // ignore write failure; IPC remains fallback
+        end if
+    end if
+end function
+
+extract_candidates = function(scan_text)
+    candidates = []
+
+    // Pass 1: HTML-style bold tokens
+    parts = scan_text.split("<b>")
+    if parts.len > 1 then
+        for p in parts[1:]
+            tp = p.split("</b>")
+            if tp.len > 0 then
+                token = tp[0].replace("\n", "").replace("\r", "")
+                add_unique(candidates, token)
+            end if
+        end for
+    end if
+
+    // Pass 2: raw text fallback
+    if candidates.len == 0 then
+        lines = scan_text.split(char(10))
+        for line in lines
+            low = line.lower
+            if low.indexOf("unchecked") != null then
+                cleaned = line.replace("<b>", "")
+                cleaned = cleaned.replace("</b>", "")
+                cleaned = cleaned.replace("\r", "")
+                add_unique(candidates, cleaned)
+            end if
+        end for
+    end if
+
+    return candidates
+end function
+
+
+// ------------------------------
+// Main LPE logic
+// ------------------------------
+
+write_status("searching")
+
+for lib_path in target_libs
+    metalib = metaxploit.load(lib_path)
+    if not metalib then continue
+
+    mem_zones = metaxploit.scan(metalib)
+    if not mem_zones then continue
+    if typeof(mem_zones) == "string" then continue
+
+    for addr in mem_zones
+        scan_text = metaxploit.scan_address(metalib, addr)
+        if typeof(scan_text) != "string" then continue
+
+        candidates = extract_candidates(scan_text)
+        if candidates.len == 0 then continue
+
+        for candidate in candidates
+            res = metalib.overflow(addr, candidate)
+            if not res then continue
+
+            elevated_comp = null
+            if typeof(res) == "shell" then
+                elevated_comp = res.host_computer
+            else if typeof(res) == "computer" then
+                elevated_comp = res
+            end if
+
+            if not elevated_comp then continue
+
+            // Payload 1: persistence
+            cu = elevated_comp.create_user("sys_backup", "p@ss123")
+
+            // Payload 2: make passwd readable
+            pw = elevated_comp.File("/etc/passwd")
+            if pw then
+                ch = pw.chmod("o+r")
+                if typeof(ch) == "string" and ch != "" then
+                    // keep going; user creation may have worked
+                end if
+            end if
+
+            if cu == true or cu == 1 then
+                write_status("success")
+            else
+                // even if create_user failed, chmod may still have succeeded
+                write_status("partial")
+            end if
+
+            exit
+        end for
+    end for
+end for
+
+write_status("failed")

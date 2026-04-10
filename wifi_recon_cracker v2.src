@@ -1,0 +1,544 @@
+// Grey Hack Wi-Fi recon/crack tool
+// Stable flow: scan, adaptive capture, crack, reconnect, LAN recon.
+
+NL = char(10)
+
+appendLine = function(lines, text)
+  lines.push(text)
+end function
+
+isError = function(value)
+  return value isa string and value != ""
+end function
+
+extractDeviceName = function(device)
+  raw = str(device)
+
+  for part in raw.split(" ")
+    if part != "" then return part
+  end for
+
+  return raw
+end function
+
+normalizeDeviceNames = function(devices)
+  names = []
+  if devices == null then return names
+
+  if devices isa list then
+    for device in devices
+      names.push(extractDeviceName(device))
+    end for
+    return names
+  end if
+
+  if devices isa map then
+    valuesList = devices.values
+    if valuesList != null and valuesList.len > 0 then
+      for device in valuesList
+        names.push(extractDeviceName(device))
+      end for
+      return names
+    end if
+
+    keyList = devices.indexes
+    if keyList != null then
+      for device in keyList
+        names.push(extractDeviceName(device))
+      end for
+    end if
+
+    return names
+  end if
+
+  names.push(extractDeviceName(devices))
+  return names
+end function
+
+pickWifiDevice = function(devices)
+  if devices == null or devices.len == 0 then return null
+
+  for device in devices
+    lowered = str(device).lower
+    if lowered.indexOf("wlan") != null then return device
+    if lowered.indexOf("wifi") != null then return device
+    if lowered.indexOf("wl") != null then return device
+    if lowered.indexOf("ath") != null then return device
+  end for
+
+  if devices.len == 1 then return devices[0]
+  return null
+end function
+
+hasValue = function(items, wanted)
+  if items == null then return 0
+
+  for item in items
+    if item == wanted then return 1
+  end for
+
+  return 0
+end function
+
+matchesTargetEssid = function(essid, targetEssid)
+  filterValue = str(targetEssid).lower
+  if filterValue == "" then return 1
+  if filterValue == "all" then return 1
+  if filterValue == "any" then return 1
+  if filterValue == "*" then return 1
+  return str(essid).lower == filterValue
+end function
+
+matchesTargetBssid = function(bssid, targetBssid)
+  filterValue = str(targetBssid).lower
+  if filterValue == "" then return 1
+  if filterValue == "all" then return 1
+  if filterValue == "any" then return 1
+  if filterValue == "*" then return 1
+  return str(bssid).lower == filterValue
+end function
+
+describeFilterValue = function(value, fallback = "all")
+  text = str(value)
+  if text == "" then return fallback
+  return text
+end function
+
+normalizeBssid = function(bssid)
+  return str(bssid).lower.split(":").join("")
+end function
+
+parsePowerPercent = function(powerText)
+  raw = str(powerText)
+  valueText = raw
+
+  if raw.indexOf("%") != null then
+    valueText = raw.split("%")[0]
+  end if
+
+  parsedValue = valueText.val
+  if parsedValue < 0 then return 0
+  if parsedValue > 100 then return 100
+  return parsedValue
+end function
+
+chooseAckTarget = function(powerText, manualAckTarget = 0)
+  if manualAckTarget > 0 then return manualAckTarget
+
+  powerValue = parsePowerPercent(powerText)
+  if powerValue <= 0 then return 20000
+
+  ackTarget = 300000 / powerValue
+  if ackTarget < 7000 then return 7000
+  if ackTarget > 20000 then return 20000
+  return ackTarget
+end function
+
+compactSplit = function(text)
+  clean = []
+
+  for part in str(text).split(" ")
+    if part != "" then clean.push(part)
+  end for
+
+  return clean
+end function
+
+parseWifiRow = function(row)
+  tokens = compactSplit(row)
+  if tokens == null or tokens.len < 3 then return null
+
+  essidParts = []
+  index = 2
+
+  while index < tokens.len
+    essidParts.push(tokens[index])
+    index = index + 1
+  end while
+
+  return {
+    "raw": str(row),
+    "bssid": tokens[0],
+    "power": tokens[1],
+    "essid": essidParts.join(" "),
+  }
+end function
+
+normalizeWifiRows = function(networks)
+  rows = []
+  if networks == null then return rows
+
+  if networks isa list then
+    for row in networks
+      rows.push(str(row))
+    end for
+    return rows
+  end if
+
+  if networks isa map then
+    valuesList = networks.values
+    if valuesList != null and valuesList.len > 0 then
+      for row in valuesList
+        rows.push(str(row))
+      end for
+      return rows
+    end if
+
+    keyList = networks.indexes
+    if keyList != null then
+      for row in keyList
+        rows.push(str(row))
+      end for
+    end if
+
+    return rows
+  end if
+
+  rows.push(str(networks))
+  return rows
+end function
+
+ensureFolder = function(computer, parentPath, folderName)
+  folderPath = parentPath + "/" + folderName
+  folder = computer.File(folderPath)
+  if folder != null then return folderPath
+
+  created = computer.create_folder(parentPath, folderName)
+  if created == 1 then return folderPath
+
+  return null
+end function
+
+ensureTextFile = function(computer, dirPath, fileName)
+  filePath = dirPath + "/" + fileName
+  file = computer.File(filePath)
+  if file != null then return file
+
+  created = computer.touch(dirPath, fileName)
+  if isError(created) then return null
+
+  return computer.File(filePath)
+end function
+
+deleteIfExists = function(computer, filePath)
+  file = computer.File(filePath)
+  if file == null then return
+  file.delete
+end function
+
+getReadableCaptureFile = function(computer, filePath)
+  file = computer.File(filePath)
+  if file == null then return null
+  if not file.is_binary then return null
+  if not file.has_permission("r") then return null
+  return file
+end function
+
+nextAvailableFileName = function(computer, dirPath, prefix, extension)
+  candidateName = prefix + extension
+  suffix = 1
+
+  while computer.File(dirPath + "/" + candidateName) != null
+    candidateName = prefix + "_" + suffix + extension
+    suffix = suffix + 1
+  end while
+
+  return candidateName
+end function
+
+archiveCaptureFile = function(computer, capturePath, archiveDir, archiveName)
+  result = {"path": "", "error": ""}
+  captureFile = getReadableCaptureFile(computer, capturePath)
+  if captureFile == null then
+    result.error = "capture file missing or unreadable"
+    return result
+  end if
+
+  copyResult = captureFile.copy(archiveDir, archiveName)
+  if copyResult != null and copyResult != 1 then
+    result.error = str(copyResult)
+    return result
+  end if
+
+  archivedFile = computer.File(archiveDir + "/" + archiveName)
+  if archivedFile == null then
+    result.error = "archive file not created"
+    return result
+  end if
+
+  result.path = archivedFile.path
+  return result
+end function
+
+getConnectedRouter = function(computer)
+  if computer == null then return null
+  if not computer.is_network_active then return null
+
+  router = get_router
+  if router == null then return null
+
+  if computer.active_net_card == "WIFI" then
+    gateway = computer.network_gateway
+    if gateway != "" and router.local_ip != gateway then
+      gatewayRouter = get_router(gateway)
+      if gatewayRouter != null then router = gatewayRouter
+    end if
+  end if
+
+  return router
+end function
+
+recordRouterRecon = function(lines, router)
+  if router == null then
+    appendLine(lines, "Router: unavailable")
+    return
+  end if
+
+  appendLine(lines, "Router ESSID: " + router.essid_name)
+  appendLine(lines, "Router BSSID: " + router.bssid_name)
+  appendLine(lines, "Router public IP: " + router.public_ip)
+  appendLine(lines, "Router local IP: " + router.local_ip)
+
+  lanHosts = router.devices_lan_ip
+  if lanHosts == null or lanHosts.len == 0 then
+    appendLine(lines, "LAN hosts: none discovered")
+    return
+  end if
+
+  appendLine(lines, "LAN hosts: " + lanHosts.join(", "))
+
+  for lanIp in lanHosts
+    ports = router.device_ports(lanIp)
+    openPorts = []
+
+    if ports isa string then
+      appendLine(lines, lanIp + " -> " + ports)
+      continue
+    end if
+
+    if ports != null then
+      for portObj in ports
+        if portObj != null and not portObj.is_closed then
+          openPorts.push("" + portObj.port_number)
+        end if
+      end for
+    end if
+
+    if openPorts.len == 0 then
+      appendLine(lines, lanIp + " -> no visible open ports")
+    else
+      appendLine(lines, lanIp + " -> " + openPorts.join(", "))
+    end if
+  end for
+end function
+
+connectWifiWithRetry = function(computer, netDevice, bssid, essid, password, cooldownSeconds = 3, maxAttempts = 4)
+  attempt = 1
+  lastResult = null
+
+  while attempt <= maxAttempts
+    lastResult = computer.connect_wifi(netDevice, bssid, essid, password)
+    if lastResult == 1 then return 1
+
+    if lastResult isa string and lastResult.indexOf("wait a moment") != null and attempt < maxAttempts then
+      print("Reconnect cooldown hit for " + essid + ", waiting " + cooldownSeconds + "s...")
+      wait cooldownSeconds
+      attempt = attempt + 1
+      continue
+    end if
+
+    return lastResult
+  end while
+
+  return lastResult
+end function
+
+crypto = include_lib("/lib/crypto.so")
+if crypto == null then exit("Missing /lib/crypto.so")
+
+shell = get_shell
+if shell == null then exit("Could not access current shell")
+
+computer = shell.host_computer
+if computer == null then exit("Could not access host computer")
+
+devices = normalizeDeviceNames(computer.network_devices)
+wifiDevice = pickWifiDevice(devices)
+
+if wifiDevice == null then
+  if devices == null or devices.len == 0 then exit("No network devices found")
+
+  print("Available network devices: " + devices.join(", "))
+  wifiDevice = user_input("Wireless device name: ")
+  if wifiDevice == "" then exit("No wireless device selected")
+  if not hasValue(devices, wifiDevice) then exit("Selected device not found: " + wifiDevice)
+end if
+
+wifiDevice = extractDeviceName(wifiDevice)
+
+targetEssid = user_input("Target ESSID [all]: ")
+
+ackInput = user_input("ACK packets per network [7000]: ")
+ackTarget = 7000
+if ackInput != "" then
+  parsedAck = ackInput.val
+  if parsedAck > 0 then ackTarget = parsedAck
+end if
+
+cooldownInput = user_input("Reconnect delay in seconds [3]: ")
+reconnectDelay = 3
+if cooldownInput != "" then
+  parsedDelay = cooldownInput.val
+  if parsedDelay > 0 then reconnectDelay = parsedDelay
+end if
+
+capturePath = current_path + "/file.cap"
+
+reportDir = ensureFolder(computer, home_dir, "loot")
+if reportDir == null then reportDir = home_dir
+
+reportFile = ensureTextFile(computer, reportDir, "wifi_recon_report.txt")
+if reportFile == null then exit("Unable to create report file")
+
+reportLines = []
+appendLine(reportLines, "Grey Hack Wi-Fi Recon Report")
+appendLine(reportLines, "Date: " + current_date)
+appendLine(reportLines, "User: " + active_user)
+appendLine(reportLines, "Device: " + wifiDevice)
+appendLine(reportLines, "Target ESSID: " + targetEssid)
+appendLine(reportLines, "ACK target: " + ackTarget)
+appendLine(reportLines, "Reconnect delay: " + reconnectDelay)
+appendLine(reportLines, "")
+
+print("Starting monitor mode on " + wifiDevice + "...")
+monitorResult = crypto.airmon("start", wifiDevice)
+if isError(monitorResult) then exit("airmon failed: " + monitorResult)
+
+networksResult = computer.wifi_networks(wifiDevice)
+if isError(networksResult) or networksResult == null then
+  crypto.airmon("stop", wifiDevice)
+  appendLine(reportLines, "Wi-Fi scan failed: " + networksResult)
+  reportFile.set_content(reportLines.join(NL))
+  exit("Wi-Fi scan failed: " + networksResult)
+end if
+
+networks = normalizeWifiRows(networksResult)
+if networks == null or networks.len == 0 then
+  crypto.airmon("stop", wifiDevice)
+  appendLine(reportLines, "No Wi-Fi networks found.")
+  reportFile.set_content(reportLines.join(NL))
+  exit("No Wi-Fi networks found. Report saved to " + reportFile.path)
+end if
+
+appendLine(reportLines, "Visible Wi-Fi networks: " + networks.len)
+appendLine(reportLines, "")
+
+crackedNetworks = []
+
+for row in networks
+  wifi = parseWifiRow(row)
+  if wifi == null then
+    appendLine(reportLines, "Skipped malformed entry: " + row)
+    appendLine(reportLines, "")
+    continue
+  end if
+
+  appendLine(reportLines, "Target: " + wifi.essid)
+  appendLine(reportLines, "BSSID: " + wifi.bssid)
+  appendLine(reportLines, "Signal: " + wifi.power)
+
+  if not matchesTargetEssid(wifi.essid, targetEssid) then
+    appendLine(reportLines, "Status: skipped by ESSID filter")
+    appendLine(reportLines, "")
+    continue
+  end if
+
+  if wifi.essid == "" then
+    appendLine(reportLines, "Password: skipped hidden/empty ESSID")
+    appendLine(reportLines, "")
+    continue
+  end if
+
+  deleteIfExists(computer, capturePath)
+
+  print("Capturing " + wifi.essid + "...")
+  captureResult = crypto.aireplay(wifi.bssid, wifi.essid, ackTarget)
+  if isError(captureResult) then
+    appendLine(reportLines, "Capture failed: " + captureResult)
+    appendLine(reportLines, "")
+    continue
+  end if
+
+  captureFile = getReadableCaptureFile(computer, capturePath)
+  if captureFile == null then
+    appendLine(reportLines, "Capture failed: file.cap missing or unreadable")
+    appendLine(reportLines, "")
+    continue
+  end if
+
+  password = crypto.aircrack(captureFile.path)
+  if password == null or password == "" then
+    appendLine(reportLines, "Password: not recovered")
+    appendLine(reportLines, "")
+    continue
+  end if
+
+  appendLine(reportLines, "Password: " + password)
+  appendLine(reportLines, "Status: cracked")
+  appendLine(reportLines, "")
+
+  crackedNetworks.push({
+    "essid": wifi.essid,
+    "bssid": wifi.bssid,
+    "power": wifi.power,
+    "password": password,
+  })
+end for
+
+crypto.airmon("stop", wifiDevice)
+deleteIfExists(computer, capturePath)
+
+appendLine(reportLines, "Connected LAN Recon")
+appendLine(reportLines, "-------------------")
+
+if crackedNetworks.len == 0 then
+  appendLine(reportLines, "No passwords recovered.")
+else
+  for network in crackedNetworks
+    appendLine(reportLines, "Reconnect target: " + network.essid)
+
+    connectResult = connectWifiWithRetry(computer, wifiDevice, network.bssid, network.essid, network.password, reconnectDelay)
+    if isError(connectResult) then
+      appendLine(reportLines, "Connect failed: " + connectResult)
+      appendLine(reportLines, "")
+      continue
+    end if
+
+    if connectResult != 1 then
+      appendLine(reportLines, "Connect failed.")
+      appendLine(reportLines, "")
+      continue
+    end if
+
+    if not computer.is_network_active then wait reconnectDelay
+
+    if not computer.is_network_active then
+      appendLine(reportLines, "Router recon skipped: no active network after connect")
+      appendLine(reportLines, "")
+      continue
+    end if
+
+    appendLine(reportLines, "Connected with password: " + network.password)
+    router = getConnectedRouter(computer)
+    recordRouterRecon(reportLines, router)
+    appendLine(reportLines, "")
+
+    wait reconnectDelay
+  end for
+end if
+
+saveResult = reportFile.set_content(reportLines.join(NL))
+if isError(saveResult) then exit("Failed to save report: " + saveResult)
+
+print("Report saved to " + reportFile.path)
+print("Recovered passwords: " + crackedNetworks.len)

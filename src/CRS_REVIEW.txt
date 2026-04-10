@@ -1,0 +1,186 @@
+CRS Code Review Report
+======================
+Date: 2026-04-08
+Scope: crs0.src, crs_core.src, crs_post.src, crs_attack.src
+Total: ~4,886 lines, ~185 functions
+
+
+1. ARCHITECTURE
+===============
+Status: OK
+
+Import chain:
+  crs0.src (entrypoint, 78 lines)
+    -> crs_core.src  (1672 lines, ~90 functions)
+    -> crs_post.src  (2445 lines, ~60 functions)
+    -> crs_attack.src (684 lines, ~16 functions)
+
+- No circular dependencies
+- All cross-file function calls resolve correctly in import order
+- /src/modules/ directory is legacy/unused (not imported by crs0.src)
+
+
+2. CRITICAL BUGS
+================
+
+BUG-01: hasAcceptedNonGuestShell returns true for unknown access
+  File: crs_post.src, ~line 136
+  Issue: When accessLevel == "" the function returns 1 (true).
+         Empty/unknown access level is treated as non-guest shell.
+  Fix: Return 0 when accessLevel == "".
+
+BUG-02: executeMissionAction passes wrong parameter
+  File: crs_post.src, ~line 2029
+  Issue: Passes runState.runtime to collectStructuredLoot() but the
+         function signature expects runtimeContext.
+  Impact: Runtime crash when mission action executes.
+  Fix: Pass the correct runtimeContext variable.
+
+BUG-03: isSameComputer false negative with empty local IPs
+  File: crs_post.src, ~line 15
+  Issue: If both firstLocalIp and secondLocalIp are "", returns 0
+         (different) instead of falling through to compare public IPs.
+  Fix: Remove or invert the early return so public IP comparison
+       still happens when local IPs are both empty.
+
+BUG-04: attemptComputerShellEscalation fallback logic
+  File: crs_post.src, ~line 233
+  Issue: If create_user fails, code tries change_password on the
+         same username. But create_user failure could mean permission
+         denied (not "user already exists"), so change_password will
+         also fail on a non-existent user.
+  Fix: Check create_user error type before falling back to
+       change_password.
+
+
+3. MEDIUM BUGS
+==============
+
+BUG-05: parseMapperHostLine missing null check on split
+  File: crs_core.src, ~line 1243
+  Issue: cleanedPart.split("=")[1] accesses index without checking
+         if split returned enough parts.
+  Fix: Validate split result length >= 2 before accessing [1].
+
+BUG-06: parseHostPortsText crash risk
+  File: crs_core.src, ~line 1209
+  Issue: part.split(" ")[0] without validating split result is not
+         null or empty.
+  Fix: Add null/length check after split.
+
+BUG-07: splitIpParts possibly over-escaped
+  File: crs_core.src, ~line 156
+  Issue: Uses "\\." which may be double-escaped depending on
+         GreyScript string handling. Should be "." for literal split
+         or "\." for regex.
+  Fix: Test with "." instead of "\\.".
+
+BUG-08: Forward dependency between crs_post and crs_attack
+  File: crs_post.src, ~line 1459
+  Issue: runManualOverflow calls runOverflow() which is defined in
+         crs_attack.src (imported AFTER crs_post.src). Works at
+         runtime because GreyScript resolves late, but fragile.
+  Risk: Low (works in practice), but breaks if resolution changes.
+
+
+4. CODE QUALITY ISSUES
+======================
+
+4.1 Duplication
+---------------
+- normalizeInput(x).trim pattern appears 100+ times across all files.
+  Could extract a short helper: norm = function(x); return normalizeInput(x).trim; end function
+
+- Cache load/save functions (signature, credential, surface, loot) all
+  follow identical TAB-delimited read/write pattern. Could extract a
+  generic loadTabCache() / saveTabCache() pair.
+
+- IP comparison logic reimplemented ~6 times with slight variations
+  across crs_core.src and crs_post.src.
+
+- Outcome/result object initialization (status, notes, ports, etc.)
+  duplicated in attackTarget, attackRankedTargets, attemptCredentialReuse,
+  and multiple other functions.
+
+4.2 Magic Numbers
+-----------------
+- Host scoring weights hardcoded without constants:
+  +20, +15, -10, +120, +140, +200, -300, -260
+  (crs_core.src hostPriorityScore, lines ~1364-1378)
+
+- Service weights hardcoded in serviceWeight() (lines ~967-986)
+
+- Cache field counts: parts.len < 5, parts.len < 6 without named
+  constants explaining expected field count.
+
+- maxAttempts = 120 in attackTarget (crs_attack.src line 315)
+  Not configurable via runConfig.
+
+4.3 Inconsistent Error Handling
+-------------------------------
+- Some functions return null on failure (ensureFolder, loadPreferredLib)
+- Some return 0 (addCredentialCacheRecord, addSurfaceRecord)
+- Some return error strings (saveCredentialCache, saveLootCache)
+- Callers use mix of isApiSuccess(), != null, != 0 checks
+
+Recommendation: Standardize on one pattern. Suggest: return null for
+"not found", return error string for failures, return result for success.
+
+4.4 Performance
+---------------
+- rankTargets (crs_core.src ~line 1388) uses O(n^2) selection sort.
+  For typical host lists (<50) this is fine, but could use built-in
+  sort if available.
+
+- Repeated .trim calls on same values within single function scope
+  (e.g., hostPriorityScore normalizes the same IP multiple times).
+
+4.5 Style
+---------
+- Several functions exceed 200 lines: attackTarget (~350 lines),
+  attemptCredentialReuse (~200 lines), collectLocalHacks (~200 lines).
+
+- Deep nesting (4-5 levels) in attack overflow loops makes logic
+  hard to follow.
+
+- Outdated module comments reference old file numbering scheme
+  (e.g., "CRS module 10", "CRS module 20").
+
+
+5. FUNCTION CROSS-REFERENCE
+============================
+
+All functions called in crs_attack.src and their definition locations:
+
+From crs_core.src:
+  normalizeInput, listHasValue, formatValueDisplay, TAB, normalizeCacheField,
+  appendLine, toYesNoFlag, isExactTargetHost, findPreferredEntryHostRecord,
+  addUniqueHostRecord, findExactTargetHostRecord, extractUnsafeValues,
+  findCachedSignatures, addSignatureCacheRecord, findHostRecordByIp
+
+From crs_post.src:
+  hasRecordedShellAccess, recordAcceptedTerminalAccess,
+  classifyTerminalAccessLevel, accessLevelScore,
+  attemptComputerShellEscalation, handleFileAttackResult,
+  scoreFileAttackOutcome, manualExploitAssist, dumpExploitSurface
+
+All functions called in crs0.src (entrypoint):
+  All resolved - no undefined references.
+
+
+6. LEGACY FILES
+===============
+/src/modules/ contains old split that mirrors the main files:
+  00_core.src, 10_access_loot.src, 20_post_access.src,
+  30_reporting_discovery.src, 40_attack_main.src
+
+These are NOT imported and can be safely deleted.
+
+
+7. SUMMARY
+==========
+- 4 critical bugs (BUG-01 through BUG-04) - recommend fixing
+- 4 medium bugs (BUG-05 through BUG-08) - recommend fixing
+- Code quality is functional but has significant duplication
+- Architecture and dependencies are sound
+- Legacy modules/ directory should be cleaned up

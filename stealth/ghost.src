@@ -1,0 +1,388 @@
+// ==========================================================
+// CRS GHOST v2.3 - Hardened Retirement Baseline
+// Logic: Secret-Aware Tokens, Grace Window, Gated Self-Destruct
+// ==========================================================
+
+// Accept CLI args when launched from a terminal, but prompt interactively when started without params.
+raw_needles = []
+use_decoys = false
+raw_signal_secret = ""
+
+if params.len > 0 then
+    raw_needles = params[0].split(",")
+    if params.len > 1 then
+        if params[1] == "1" then
+            use_decoys = true
+        end if
+    end if
+    if params.len > 2 then
+        raw_signal_secret = params[2]
+    end if
+else
+    input_ips = user_input("Enter IPs to scrub (comma separated): ")
+    if typeof(input_ips) != "string" or input_ips.trim == "" then
+        exit("Fatal: No IPs provided.")
+    end if
+    raw_needles = input_ips.split(",")
+
+    input_decoy = user_input("Enable Decoy Mode? (1=Yes, 0=No): ")
+    if typeof(input_decoy) == "string" then
+        if input_decoy.trim == "1" then
+            use_decoys = true
+        end if
+    end if
+
+    input_secret = user_input("Enter Signal Secret (Optional): ")
+    if typeof(input_secret) == "string" then
+        raw_signal_secret = input_secret.trim
+    end if
+end if
+
+active_needles = []
+for n in raw_needles
+    cleanN = n.trim
+    if is_valid_ip(cleanN) then
+        if cleanN != "0.0.0.0" then
+            active_needles.push(cleanN)
+        end if
+    end if
+end for
+if active_needles.len == 0 then exit("<b>[!] Fatal:</b> No valid IPs.")
+
+log_path = "/var/system.log"
+comp = get_shell.host_computer
+max_runtime = 3600
+start_time = time
+retirement_deadline = 0
+retirement_hard_stop = 0
+signal_plain = "SIGGHOSTEXIT42"
+
+validate_secret = function(secretText)
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    if secretText == "" then
+        return 1
+    end if
+    for ch in secretText.values
+        if allowed.indexOf(ch) == null then
+            return 0
+        end if
+    end for
+    return 1
+end function
+
+resolve_signal_secret = function(rawSecret)
+    secretText = ""
+    if typeof(rawSecret) == "string" then
+        secretText = rawSecret.trim
+    end if
+    if secretText == "" then
+        secretText = active_needles.join("|")
+    end if
+    if secretText == "" then
+        secretText = signal_plain
+    end if
+    return secretText
+end function
+
+encode_signal_token = function(signalText, secretText)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    if signalText == "" then
+        return ""
+    end if
+    if secretText == "" then
+        return signalText
+    end if
+
+    out = []
+    index = 0
+    upperSignal = signalText.upper
+    for ch in upperSignal.values
+        pos = alphabet.indexOf(ch)
+        if pos == null then
+            out.push(ch)
+            continue
+        end if
+
+        secretChar = secretText[index % secretText.len]
+        shift = (secretChar.code + index + secretText.len) % alphabet.len
+        encodedPos = (pos + shift) % alphabet.len
+        out.push(alphabet[encodedPos])
+        index = index + 1
+    end for
+    return out.join("")
+end function
+
+if typeof(raw_signal_secret) == "string" then
+    if raw_signal_secret.trim != "" then
+        if not validate_secret(raw_signal_secret.trim) then
+            exit("<b>[!] Fatal:</b> signal_secret supports only A-Z, a-z, 0-9, _ and -.")
+        end if
+    end if
+end if
+
+signal_secret = resolve_signal_secret(raw_signal_secret)
+exit_signal = encode_signal_token(signal_plain, signal_secret)
+
+harvest_decoys = function()
+    candidates = []
+    r = get_router
+    if r then
+        devs = r.devices_lan_ip
+        if typeof(devs) == "list" then candidates = devs
+    end if
+
+    if candidates.len < 3 then
+        f = comp.File(log_path)
+        if f then
+            if f.has_permission("r") then
+                content = f.get_content
+                if typeof(content) == "string" then
+                    if content != "" then
+                        tokens = content.replace(char(10), " ").replace(":", " ").split(" ")
+                        for t in tokens
+                            cleanT = t.trim
+                            if is_valid_ip(cleanT) then
+                                candidates.push(cleanT)
+                            end if
+                        end for
+                    end if
+                end if
+            end if
+        end if
+    end if
+
+    final_decoys = []
+    fallbacks = ["192.168.1.10", "10.0.0.5", "172.16.0.10"]
+    all_potential = candidates + fallbacks
+
+    for c in all_potential
+        if c == "0.0.0.0" or not is_valid_ip(c) then
+            continue
+        end if
+        if active_needles.indexOf(c) != null then
+            continue
+        end if
+        if final_decoys.indexOf(c) == null then
+            final_decoys.push(c)
+        end if
+    end for
+    return final_decoys
+end function
+
+active_decoys = []
+if use_decoys then
+    active_decoys = harvest_decoys
+    if active_decoys.len == 0 then
+        use_decoys = false
+    end if
+end if
+
+isApiSuccess = function(res)
+    if res == null or res == 0 or res == false then
+        return false
+    end if
+    if typeof(res) == "string" then
+        if res.len > 0 then
+            return false
+        end if
+    end if
+    return true
+end function
+
+probe_session_state = function()
+    procs = comp.show_procs
+    if typeof(procs) != "string" or procs == "" then
+        return "blind"
+    end if
+    lines = procs.split(char(10))
+    for proc_line in lines
+        normalized = proc_line
+        while normalized.indexOf("  ") != null; normalized = normalized.replace("  ", " "); end while
+        normalized = normalized.trim
+        if normalized == "" then
+            continue
+        end if
+        lowered = normalized.lower
+        if lowered.indexOf("---") != null then
+            continue
+        end if
+        if lowered.indexOf("user") != null and lowered.indexOf("pid") != null then
+            continue
+        end if
+        if lowered.indexOf("name") != null and lowered.indexOf("pid") != null then
+            continue
+        end if
+        // A dsession means a logged-in user is present; it does not prove the user is an admin.
+        if lowered.indexOf("dsession") != null then
+            return "occupied"
+        end if
+    end for
+    return "clear"
+end function
+
+check_exit_signal = function()
+    f = comp.File(log_path)
+    if not f then
+        return 2
+    end if
+    if not f.has_permission("r") then
+        return 2
+    end if
+    content = f.get_content
+    if typeof(content) != "string" then
+        return 2
+    end if
+    if content == "" then
+        return 1
+    end if
+    if content.lower.indexOf(exit_signal.lower) != null then
+        return 0
+    end if
+    return 1
+end function
+
+process_logs = function()
+    f = comp.File(log_path)
+    if not f then
+        return 0
+    end if
+    if not f.has_permission("r") or not f.has_permission("w") then
+        return 0
+    end if
+    content = f.get_content
+    if content == "" then
+        return 0
+    end if
+    lines = content.split(char(10))
+    dirty = false
+    found_exit = false
+    new_lines = []
+    trace_keywords = ["shell obtained", "file deleted", "redirection", exit_signal]
+
+    for line in lines
+        is_trace = false
+        l_low = line.lower
+        if l_low.indexOf(exit_signal.lower) != null then
+            found_exit = true
+            is_trace = true
+        end if
+        if not is_trace then
+            for ip in active_needles
+                if l_low.indexOf(ip) != null then
+                    for kw in trace_keywords
+                        if l_low.indexOf(kw.lower) != null then
+                            is_trace = true
+                            break
+                        end if
+                    end for
+                end if
+                if is_trace then break
+            end for
+        end if
+        if is_trace then
+            dirty = true
+            if use_decoys then
+                if l_low.indexOf(exit_signal.lower) == null then
+                    spoofed_line = line
+                    decoy_ip = active_decoys[floor(rnd * active_decoys.len)]
+                    for ip in active_needles
+                        spoofed_line = spoofed_line.replace(ip, decoy_ip)
+                    end for
+                    new_lines.push(spoofed_line)
+                end if
+            end if
+        else
+            new_lines.push(line)
+        end if
+    end for
+
+    if dirty then
+        if isApiSuccess(f.set_content(new_lines.join(char(10)))) then
+            if found_exit then
+                return 2
+            end if
+            return 1
+        end if
+        return 0
+    end if
+    return 0
+end function
+
+print("<b>[Ghost v2.3]</b> Shadow daemon active.")
+my_file = comp.File(program_path)
+purged = false
+if my_file then
+    if isApiSuccess(my_file.delete) then
+        purged = true
+        print("<b>[Ghost]</b> Binary purged.")
+    else
+        print("<b>[!] Ghost:</b> Initial purge failed.")
+    end if
+end if
+
+while true
+    now = time
+    if retirement_deadline == 0 then
+        if now - start_time > max_runtime then
+            exit()
+        end if
+    end if
+    if retirement_hard_stop > 0 then
+        if now > retirement_hard_stop then
+            exit()
+        end if
+    end if
+
+    state = probe_session_state
+
+    if retirement_deadline > 0 then
+        if now > retirement_deadline then
+            if state != "blind" then
+                process_logs
+                sig_state = check_exit_signal
+                if sig_state == 1 then
+                    if not purged then
+                        f = comp.File(program_path)
+                        if f then
+                            if isApiSuccess(f.delete) then
+                                purged = true
+                            end if
+                        end if
+                    end if
+                    if purged then
+                        exit()
+                    end if
+                end if
+            end if
+        end if
+    end if
+
+    if state == "blind" then
+        if retirement_deadline == 0 then
+            sig_state = check_exit_signal
+            if sig_state == 0 then
+                retirement_deadline = now + 300
+                retirement_hard_stop = now + 1800
+            end if
+        end if
+        wait(15.0)
+    else if state == "occupied" then
+        status = process_logs
+        if status == 2 then
+            if retirement_deadline == 0 then
+                retirement_deadline = now + 300
+                retirement_hard_stop = now + 1800
+            end if
+        end if
+        wait(5.0)
+    else
+        status = process_logs
+        if status == 2 then
+            if retirement_deadline == 0 then
+                retirement_deadline = now + 300
+                retirement_hard_stop = now + 1800
+            end if
+        end if
+        wait(0.5)
+    end if
+end while

@@ -1,0 +1,156 @@
+// CRS main entrypoint — v2 (auto-loop)
+// Default deploy root: /home/z3r0/crs
+// Update the three import paths below to the actual in-game folder.
+
+import_code("/home/z3r0/crs/crs_core.src")
+import_code("/home/z3r0/crs/crs_post.src")
+import_code("/home/z3r0/crs/crs_attack.src")
+
+// -----------------------------------------------------------------------
+// runCycle: execute one full discovery → attack → credential → finalize
+// pass in overrides for target IP/LAN so the auto-loop can re-target.
+// -----------------------------------------------------------------------
+runCycle = function(overrideTargetIp, overrideTargetLanIp, runConfig, runtimeContext)
+  // Clone config so overrides don't bleed between iterations.
+  cycleConfig = {}
+  for k in runConfig.keys
+    cycleConfig[k] = runConfig[k]
+  end for
+  if overrideTargetIp != "" then cycleConfig.target_ip = overrideTargetIp
+  if overrideTargetLanIp != "" then cycleConfig.target_lan_ip = overrideTargetLanIp
+
+  targetContext = buildTargetContext(cycleConfig, runtimeContext)
+  cycleConfig.mode = resolveMode(cycleConfig, targetContext)
+
+  outputFiles = prepareOutputFiles(runtimeContext, cycleConfig)
+  if outputFiles == null then
+    print("CRS: unable to prepare output files for target " + overrideTargetIp + " / " + overrideTargetLanIp)
+    return null
+  end if
+
+  runState = buildInitialRunState(runtimeContext, cycleConfig, targetContext, outputFiles)
+  printStartupSummary(runtimeContext, cycleConfig, targetContext, outputFiles)
+  startupReportResult = writeStartupReport(runtimeContext, cycleConfig, targetContext, outputFiles)
+  if startupReportResult != 1 then
+    print("CRS: unable to write startup report: " + normalizeInput(startupReportResult))
+    return runState
+  end if
+
+  discoveredHosts = discoverTargets(targetContext, runtimeContext, runState)
+  rankedHosts = rankTargets(discoveredHosts, targetContext, runState)
+  selectedHostIp = promptTargetHostMenu(rankedHosts, targetContext, cycleConfig, runState)
+  if selectedHostIp == "" and rankedHosts != null and rankedHosts.len > 0 then selectedHostIp = rankedHosts[0].ip
+  runState.selected_host_ip = selectedHostIp
+  selectedHostRecord = findHostRecordByIp(rankedHosts, selectedHostIp)
+  runState.selected_host_record = selectedHostRecord
+
+  saveHostCacheResult = saveHostCache(outputFiles.host_cache_file, rankedHosts)
+  if isError(saveHostCacheResult) then
+    print("CRS: unable to save host cache: " + saveHostCacheResult)
+    return runState
+  end if
+
+  printDiscoverySummary(rankedHosts, selectedHostIp)
+
+  attackResult = attackRankedTargets(rankedHosts, selectedHostRecord, runtimeContext, runState)
+  runState.attack_result = attackResult
+
+  credentialResult = null
+  if shouldDeferCredentialReuseToRouterHandoff(runState) then
+    credentialResult = {
+      "status": "deferred-router-handoff",
+      "shell": null,
+      "host_ip": "",
+      "user": "",
+      "source_host": "",
+      "attempts": 0,
+      "successes": 0,
+      "scanned_files": 0,
+      "password_candidates": 0,
+      "loot_records": 0,
+      "notes": ["Credential reuse deferred until router handoff completes."],
+    }
+  else
+    credentialResult = attemptCredentialReuse(runtimeContext, runState, attackResult)
+  end if
+  runState.credential_result = credentialResult
+  printCredentialSummary(credentialResult)
+
+  finalResult = finalizeAcceptedAccess(runState)
+  printFinalSummary(finalResult)
+
+  saveSignatureCacheResult = saveSignatureCache(outputFiles.signature_cache_file, runState.signature_cache)
+  if isError(saveSignatureCacheResult) then print("CRS: signature cache save error: " + saveSignatureCacheResult)
+
+  saveCredentialCacheResult = saveCredentialCache(outputFiles.credential_cache_file, runState.credential_cache)
+  if isError(saveCredentialCacheResult) then print("CRS: credential cache save error: " + saveCredentialCacheResult)
+
+  saveSurfaceCacheResult = saveSurfaceCache(outputFiles.surface_cache_file, runState)
+  if isError(saveSurfaceCacheResult) then print("CRS: surface cache save error: " + saveSurfaceCacheResult)
+
+  saveLootCacheResult = saveLootCache(outputFiles.loot_cache_file, runState)
+  if isError(saveLootCacheResult) then print("CRS: loot cache save error: " + saveLootCacheResult)
+
+  discoveryReportResult = writeDiscoveryReport(runtimeContext, cycleConfig, targetContext, outputFiles, discoveredHosts, rankedHosts, selectedHostIp, attackResult, credentialResult, finalResult)
+  if isError(discoveryReportResult) then print("CRS: discovery report error: " + discoveryReportResult)
+
+  print("CRS run complete. Reports and caches updated.")
+  return runState
+end function
+
+// -----------------------------------------------------------------------
+// MAIN — bootstrap then auto-loop if enabled
+// -----------------------------------------------------------------------
+runConfig = buildRunConfig()
+runtimeContext = buildRuntimeContext(runConfig.lib_dir)
+runConfig = promptForMissingInputs(runConfig)
+
+visitedHosts = []
+loopCount = 0
+currentTargetIp = normalizeInput(runConfig.target_ip).trim
+currentTargetLanIp = normalizeInput(runConfig.target_lan_ip).trim
+
+while 1
+  yield
+  loopCount = loopCount + 1
+  print("CRS auto-loop iteration " + loopCount + " — target: " + formatValueDisplay(currentTargetLanIp) + " / " + formatValueDisplay(currentTargetIp))
+
+  runState = runCycle(currentTargetIp, currentTargetLanIp, runConfig, runtimeContext)
+
+  // Always stop if auto-loop is disabled or cycle failed.
+  if not runConfig.auto_loop then break
+  if runState == null then break
+
+  // Stop if we hit the iteration cap.
+  if loopCount >= MAX_AUTO_LOOP_HOPS then
+    print("CRS auto-loop: iteration cap (" + MAX_AUTO_LOOP_HOPS + ") reached. Stopping.")
+    break
+  end if
+
+  // Identify next hop from local recon.
+  nextHop = normalizeInput(runState.preferred_next_host).trim
+  if nextHop == "" then
+    print("CRS auto-loop: no preferred next hop identified. Stopping.")
+    break
+  end if
+
+  // Guard against revisiting the same host.
+  if listHasValue(visitedHosts, nextHop) then
+    print("CRS auto-loop: next hop " + nextHop + " already visited. Stopping.")
+    break
+  end if
+
+  // Reject the hop if it is the machine we are already on.
+  runtimeLocalIp = normalizeInput(runtimeContext.computer.local_ip).trim
+  if nextHop == runtimeLocalIp then
+    print("CRS auto-loop: next hop " + nextHop + " is the current host. Stopping.")
+    break
+  end if
+
+  visitedHosts.push(nextHop)
+  print("CRS auto-loop: advancing to next hop " + nextHop)
+  currentTargetIp = ""
+  currentTargetLanIp = nextHop
+end while
+
+print("CRS session complete. Iterations: " + loopCount)

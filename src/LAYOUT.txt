@@ -1,0 +1,38 @@
+CRS 4-file layout
+=================
+
+Primary files:
+- crs0.src
+- crs_core.src
+- crs_post.src
+- crs_attack.src
+
+Role split:
+- crs0.src
+  Main entrypoint only.
+- crs_core.src
+  Constants, cache/runtime helpers, reporting, discovery, ranking, host selection.
+- crs_post.src
+  Access typing, escalation, credential reuse, loot, staging, handoff, cleanup, finalization.
+- crs_attack.src
+  Exploit surface parsing, manual assist, queueing, router/file exploit flow, target attack execution.
+
+Import order in crs0.src:
+1. crs_core.src
+2. crs_post.src
+3. crs_attack.src
+
+Default deploy root:
+- /home/z3r0/crs
+
+Compile:
+- compile /home/z3r0/crs/crs0.src /home/z3r0/crs allow_import
+
+Run:
+- /home/z3r0/crs/crs0
+
+Notes:
+- import_code() must use literal absolute paths.
+- Compile only crs0.src.
+- If you deploy elsewhere, update crs0.src or start from crs0.template.src.
+- src/modules/ is legacy from the previous split attempt and is not the primary layout anymore.

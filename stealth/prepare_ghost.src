@@ -1,0 +1,157 @@
+// prepare_ghost.src - Operator Utility (v2.3 Hardened)
+comp = get_shell.host_computer
+r = get_router
+raw_ips = [comp.public_ip, comp.local_ip]
+raw_signal_secret = ""
+selected_decoy_mode = "1"
+binary_name = "updatedb"
+signal_plain = "SIGGHOSTEXIT42"
+
+validate_secret = function(secretText)
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    if secretText == "" then
+        return 1
+    end if
+    for ch in secretText.values
+        if allowed.indexOf(ch) == null then
+            return 0
+        end if
+    end for
+    return 1
+end function
+
+validate_binary_name = function(nameText)
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    cleanName = ""
+    if typeof(nameText) == "string" then cleanName = nameText.trim
+    if cleanName == "" then return 0
+    for ch in cleanName.values
+        if allowed.indexOf(ch) == null then
+            return 0
+        end if
+    end for
+    return 1
+end function
+
+if params.len > 0 then
+    firstArg = params[0].trim
+    if firstArg == "0" or firstArg == "1" then
+        selected_decoy_mode = firstArg
+        if params.len > 1 then
+            secondArg = params[1].trim
+            if params.len > 2 then
+                raw_signal_secret = secondArg
+            else if validate_binary_name(secondArg) then
+                binary_name = secondArg
+            end if
+        end if
+    else
+        raw_signal_secret = firstArg
+        if params.len > 1 then
+            secondArg = params[1].trim
+            if secondArg == "0" or secondArg == "1" then
+                selected_decoy_mode = secondArg
+            else if validate_binary_name(secondArg) then
+                binary_name = secondArg
+            end if
+        end if
+    end if
+
+    if params.len > 2 then
+        thirdArg = params[2].trim
+        if validate_binary_name(thirdArg) then
+            binary_name = thirdArg
+        end if
+    end if
+end if
+
+resolve_signal_secret = function(rawSecret, ipList)
+    secretText = ""
+    if typeof(rawSecret) == "string" then
+        secretText = rawSecret.trim
+    end if
+    if secretText == "" then
+        secretText = ipList.join("|")
+    end if
+    if secretText == "" then
+        secretText = signal_plain
+    end if
+    return secretText
+end function
+
+encode_signal_token = function(signalText, secretText)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    if signalText == "" then
+        return ""
+    end if
+    if secretText == "" then
+        return signalText
+    end if
+
+    out = []
+    index = 0
+    upperSignal = signalText.upper
+    for ch in upperSignal.values
+        pos = alphabet.indexOf(ch)
+        if pos == null then
+            out.push(ch)
+            continue
+        end if
+
+        secretChar = secretText[index % secretText.len]
+        shift = (secretChar.code + index + secretText.len) % alphabet.len
+        encodedPos = (pos + shift) % alphabet.len
+        out.push(alphabet[encodedPos])
+        index = index + 1
+    end for
+    return out.join("")
+end function
+
+if typeof(raw_signal_secret) == "string" then
+    if raw_signal_secret.trim != "" then
+        if not validate_secret(raw_signal_secret.trim) then
+            exit("<b>[!] Error:</b> Secret supports only A-Z, a-z, 0-9, _ and -.")
+        end if
+    end if
+end if
+
+if r then
+    if raw_ips.indexOf(r.public_ip) == null then
+        raw_ips.push(r.public_ip)
+    end if
+    if raw_ips.indexOf(r.local_ip) == null then
+        raw_ips.push(r.local_ip)
+    end if
+end if
+
+final_ips = []
+for ip in raw_ips
+    if ip == null or ip == "0.0.0.0" or not is_valid_ip(ip) then
+        continue
+    end if
+    if final_ips.indexOf(ip) == null then
+        final_ips.push(ip)
+    end if
+end for
+if final_ips.len == 0 then
+    exit("<b>[!] Error:</b> No operational IPs resolved.")
+end if
+
+signal_secret = resolve_signal_secret(raw_signal_secret, final_ips)
+recall_token = encode_signal_token(signal_plain, signal_secret)
+
+launch_cmd = "./" + binary_name + " " + final_ips.join(",") + " " + selected_decoy_mode
+crs_flags = "--ghost-auto 1 --ghost-decoys " + selected_decoy_mode + " --ghost-binary " + binary_name
+if typeof(raw_signal_secret) == "string" then
+    if raw_signal_secret.trim != "" then
+        launch_cmd = launch_cmd + " " + raw_signal_secret.trim
+        crs_flags = crs_flags + " --ghost-secret " + raw_signal_secret.trim
+    end if
+end if
+
+print("<b>[Ghost Preparer]</b> Deploy using:")
+print(launch_cmd)
+print("<b>[Ghost Preparer]</b> CRS flags:")
+print(crs_flags)
+print("<b>[Ghost Preparer]</b> Recall token:")
+print(recall_token)

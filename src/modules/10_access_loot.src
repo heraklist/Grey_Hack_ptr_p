@@ -1,0 +1,1216 @@
+// CRS module 10: access classification, escalation, credential reuse, loot collection.
+
+isSameComputer = function(firstComputer, secondComputer)
+  if firstComputer == null or secondComputer == null then return 0
+
+  firstPublicIp = norm(firstComputer.public_ip)
+  firstLocalIp = norm(firstComputer.local_ip)
+  secondPublicIp = norm(secondComputer.public_ip)
+  secondLocalIp = norm(secondComputer.local_ip)
+
+  if firstPublicIp != "" and secondPublicIp != "" and firstPublicIp != secondPublicIp then return 0
+  if firstLocalIp != "" and secondLocalIp != "" and firstLocalIp != secondLocalIp then return 0
+  if firstPublicIp != "" and secondPublicIp != "" then return 1
+  if firstLocalIp != "" and secondLocalIp != "" then return 1
+  return 0
+end function
+
+computerHasOpenPort = function(remoteComputer, portNumber)
+  if remoteComputer == null then return 0
+
+  ports = remoteComputer.get_ports
+  if ports == null then return 0
+
+  for portObj in ports
+    if portObj == null then continue
+    if portObj.is_closed then continue
+    if portObj.port_number == portNumber then return 1
+  end for
+
+  return 0
+end function
+
+buildRemoteLoginAddresses = function(localShell, remoteComputer)
+  addresses = []
+  seen = []
+  if remoteComputer == null then return addresses
+
+  remotePublicIp = norm(remoteComputer.public_ip)
+  remoteLocalIp = norm(remoteComputer.local_ip)
+
+  if localShell != null then
+    currentComputer = localShell.host_computer
+    if currentComputer != null then
+      currentPublicIp = norm(currentComputer.public_ip)
+      if currentPublicIp != "" and currentPublicIp == remotePublicIp then pushUniqueString(addresses, seen, remoteLocalIp)
+    end if
+  end if
+
+  pushUniqueString(addresses, seen, remotePublicIp)
+  pushUniqueString(addresses, seen, remoteLocalIp)
+  return addresses
+end function
+
+loginAccessType = function(accessObject)
+  lowered = normLower(typeof(accessObject))
+  if lowered == "shell" then return "shell"
+  if lowered.indexOf("ftp") != null then return "ftp"
+  return lowered
+end function
+
+isTerminalAccessType = function(accessType)
+  lowered = normLower(accessType)
+  if lowered == "shell" then return 1
+  return 0
+end function
+
+isCredentialAccessType = function(accessType)
+  lowered = normLower(accessType)
+  if lowered == "shell" then return 1
+  if lowered == "ftp" then return 1
+  return 0
+end function
+
+classifyComputerAccessLevel = function(remoteComputer, targetUser = "")
+  if remoteComputer == null then return "none"
+
+  shadowFile = remoteComputer.File("/etc/shadow")
+  if shadowFile != null and not shadowFile.is_folder and shadowFile.has_permission("r") then return "root"
+
+  rootFolder = remoteComputer.File("/root")
+  if rootFolder != null and rootFolder.is_folder and rootFolder.has_permission("r") then return "root"
+
+  readableUsers = listReadableUserHomes(remoteComputer)
+  if readableUsers == null or readableUsers.len == 0 then return "guest"
+
+  normalizedTargetUser = norm(targetUser)
+  if normalizedTargetUser != "" and listHasValue(readableUsers, normalizedTargetUser) then return "user"
+
+  for readableUser in readableUsers
+    if normLower(readableUser) != "guest" then return "user"
+  end for
+
+  return "guest"
+end function
+
+classifyTerminalAccessLevel = function(accessObject, targetUser = "")
+  remoteComputer = getAccessHostComputer(accessObject)
+  return classifyComputerAccessLevel(remoteComputer, targetUser)
+end function
+
+accessLevelScore = function(accessLevel)
+  lowered = normLower(accessLevel)
+  if lowered == "root" then return 3
+  if lowered == "user" then return 2
+  if lowered == "guest" then return 1
+  return 0
+end function
+
+recordAcceptedTerminalAccess = function(accessObject, targetRecord, runState)
+  accessType = loginAccessType(accessObject)
+  if not isTerminalAccessType(accessType) then return 0
+
+  accessLevel = classifyTerminalAccessLevel(accessObject, runState.target.target_user)
+  hostKey = buildHostKey(targetRecord.public_ip, targetRecord.lan_ip)
+  roleText = normLower(targetRecord.role)
+
+  if accessLevel == "guest" and roleText.indexOf("gateway") == null then
+    runState.provisional_shell = accessObject
+    runState.provisional_access_level = accessLevel
+    runState.provisional_host_key = hostKey
+    return 0
+  end if
+
+  runState.accepted_shell = accessObject
+  runState.accepted_access_level = accessLevel
+  runState.accepted_host_key = hostKey
+  return 1
+end function
+
+hasAcceptedNonGuestShell = function(runState)
+  if runState == null then return 0
+  if runState.accepted_shell == null then return 0
+
+  accessLevel = normLower(runState.accepted_access_level)
+  if accessLevel == "" then return 0
+  if accessLevel == "guest" then return 0
+  return 1
+end function
+
+detectComputerUserState = function(remoteComputer, wantedUser)
+  if remoteComputer == null then return -1
+
+  cleanWanted = norm(wantedUser)
+  if cleanWanted == "" then return -1
+
+  inspected = 0
+  passwdFile = remoteComputer.File("/etc/passwd")
+  passwdContent = readTextFile(passwdFile)
+  if passwdContent != null and passwdContent != "" then
+    inspected = 1
+    for line in passwdContent.split(NL)
+      cleanLine = norm(line)
+      if cleanLine == "" then continue
+      parts = cleanLine.split(":")
+      if parts == null or parts.len == 0 then continue
+      if norm(parts[0]) == cleanWanted then return 1
+    end for
+  end if
+
+  homeFolder = remoteComputer.File("/home")
+  if homeFolder != null and homeFolder.is_folder and homeFolder.has_permission("r") then
+    inspected = 1
+    for userName in listReadableUserHomes(remoteComputer)
+      if normalizeInput(userName).trim == cleanWanted then return 1
+    end for
+  end if
+
+  if inspected then return 0
+  return -1
+end function
+
+tryCredentialServiceAccess = function(sourceShell, remoteComputer, userName, passwordValue, portNumber, serviceType = "")
+  if sourceShell == null then return null
+  if remoteComputer == null then return null
+
+  for address in buildRemoteLoginAddresses(sourceShell, remoteComputer)
+    if serviceType == "" then
+      connection = sourceShell.connect_service(address, portNumber, userName, passwordValue)
+    else
+      connection = sourceShell.connect_service(address, portNumber, userName, passwordValue, serviceType)
+    end if
+
+    if connection == null then continue
+    if not isCredentialAccessType(loginAccessType(connection)) then continue
+    if isSameComputer(connection.host_computer, remoteComputer) then return connection
+  end for
+
+  return null
+end function
+
+getCredentialShellForComputer = function(localShell, remoteComputer, userName, passwordValue)
+  if remoteComputer == null then return null
+
+  localComputer = null
+  if localShell != null then localComputer = localShell.host_computer
+  if localComputer != null and isSameComputer(localComputer, remoteComputer) then
+    loginShell = get_shell(userName, passwordValue)
+    if loginShell != null and isSameComputer(loginShell.host_computer, remoteComputer) then return loginShell
+  end if
+
+  shouldTrySsh = 1
+  remotePorts = remoteComputer.get_ports
+  if remotePorts != null and not computerHasOpenPort(remoteComputer, 22) then shouldTrySsh = 0
+
+  if shouldTrySsh then
+    sshConnection = tryCredentialServiceAccess(localShell, remoteComputer, userName, passwordValue, 22, "ssh")
+    if sshConnection != null then return sshConnection
+  end if
+
+  return null
+end function
+
+attemptComputerShellEscalation = function(localShell, remoteComputer, targetRecord, runState)
+  outcome = {
+    "status": "not-attempted",
+    "shell": null,
+    "access_type": "",
+    "user": "",
+    "notes": [],
+  }
+
+  if localShell == null then
+    outcome.status = "missing-local-shell"
+    return outcome
+  end if
+
+  if remoteComputer == null then
+    outcome.status = "missing-computer"
+    return outcome
+  end if
+
+  hostKey = buildHostKey(remoteComputer.public_ip, remoteComputer.local_ip)
+  appendLine(outcome.notes, "Computer access obtained; attempting shell escalation.")
+
+  changeResult = remoteComputer.change_password(DEFAULT_ROOT_BOOTSTRAP_USER, DEFAULT_ROOT_BOOTSTRAP_PASSWORD)
+  if isApiSuccess(changeResult) then
+    outcome.status = "root-password-changed"
+    outcome.user = DEFAULT_ROOT_BOOTSTRAP_USER
+    appendLine(outcome.notes, "Root password changed to configured bootstrap password.")
+
+    loginShell = getCredentialShellForComputer(localShell, remoteComputer, DEFAULT_ROOT_BOOTSTRAP_USER, DEFAULT_ROOT_BOOTSTRAP_PASSWORD)
+    if loginShell != null then
+      outcome.shell = loginShell
+      outcome.access_type = loginAccessType(loginShell)
+      if outcome.access_type == "shell" then
+        outcome.status = "root-shell"
+      else
+        outcome.status = outcome.access_type + "-shell"
+      end if
+      addCredentialCacheRecord(runState.credential_cache, remoteComputer.public_ip, remoteComputer.local_ip, DEFAULT_ROOT_BOOTSTRAP_USER, DEFAULT_ROOT_BOOTSTRAP_PASSWORD, "computer-escalation")
+      recordAcceptedTerminalAccess(loginShell, targetRecord, runState)
+      appendLine(outcome.notes, "Shell login succeeded with root bootstrap credentials.")
+      return outcome
+    end if
+
+    appendLine(outcome.notes, "Root password changed, but shell login failed.")
+  else
+    appendLine(outcome.notes, "Root password change failed: " + normalizeInput(changeResult))
+  end if
+
+  createResult = remoteComputer.create_user(DEFAULT_PERSISTENCE_BOOTSTRAP_USER, DEFAULT_PERSISTENCE_BOOTSTRAP_PASSWORD)
+  if not isApiSuccess(createResult) then
+    userState = detectComputerUserState(remoteComputer, DEFAULT_PERSISTENCE_BOOTSTRAP_USER)
+    if userState == 0 then
+      outcome.status = "no-shell"
+      appendLine(outcome.notes, "Persistence bootstrap failed because the persistence user does not exist: " + normalizeInput(createResult))
+      return outcome
+    end if
+
+    changePersistenceResult = remoteComputer.change_password(DEFAULT_PERSISTENCE_BOOTSTRAP_USER, DEFAULT_PERSISTENCE_BOOTSTRAP_PASSWORD)
+    if not isApiSuccess(changePersistenceResult) then
+      outcome.status = "no-shell"
+      appendLine(outcome.notes, "Persistence bootstrap failed: create_user=" + normalizeInput(createResult) + " / change_password=" + normalizeInput(changePersistenceResult))
+      return outcome
+    end if
+
+    outcome.status = "persistence-password-changed"
+    outcome.user = DEFAULT_PERSISTENCE_BOOTSTRAP_USER
+    appendLine(outcome.notes, "Existing persistence user password changed to configured bootstrap password.")
+  else
+    outcome.status = "persistence-user-created"
+    outcome.user = DEFAULT_PERSISTENCE_BOOTSTRAP_USER
+    addCleanupUserTarget(runState, hostKey, DEFAULT_PERSISTENCE_BOOTSTRAP_USER, 1)
+    appendLine(outcome.notes, "Persistence user created with configured bootstrap password.")
+  end if
+
+  persistenceShell = getCredentialShellForComputer(localShell, remoteComputer, DEFAULT_PERSISTENCE_BOOTSTRAP_USER, DEFAULT_PERSISTENCE_BOOTSTRAP_PASSWORD)
+  if persistenceShell == null then
+    outcome.status = "no-shell"
+    appendLine(outcome.notes, "Persistence credentials prepared, but shell login failed.")
+    return outcome
+  end if
+
+  outcome.shell = persistenceShell
+  outcome.access_type = loginAccessType(persistenceShell)
+  if outcome.access_type == "shell" then
+    outcome.status = "persistence-shell"
+  else
+    outcome.status = outcome.access_type + "-shell"
+  end if
+  addCredentialCacheRecord(runState.credential_cache, remoteComputer.public_ip, remoteComputer.local_ip, DEFAULT_PERSISTENCE_BOOTSTRAP_USER, DEFAULT_PERSISTENCE_BOOTSTRAP_PASSWORD, "computer-escalation")
+  recordAcceptedTerminalAccess(persistenceShell, targetRecord, runState)
+  appendLine(outcome.notes, "Shell login succeeded with persistence credentials.")
+  return outcome
+end function
+
+pathBaseName = function(pathValue)
+  pathText = normalizeInput(pathValue).trim
+  if pathText == "" then return ""
+
+  parts = pathText.split("/")
+  if parts == null or parts.len == 0 then return pathText
+
+  lastPart = parts[parts.len - 1]
+  if lastPart != "" then return lastPart
+  if parts.len > 1 then return parts[parts.len - 2]
+  return pathText
+end function
+
+pathParentDir = function(pathValue)
+  pathText = norm(pathValue)
+  if pathText == "" then return ""
+
+  parts = pathText.split("/")
+  if parts == null or parts.len <= 1 then return ""
+  return parts[0:parts.len - 1].join("/")
+end function
+
+addUniquePathValue = function(paths, seen, pathValue)
+  cleanPath = norm(pathValue)
+  if cleanPath == "" then return 0
+  if seen.hasIndex(cleanPath) then return 0
+  seen[cleanPath] = 1
+  paths.push(cleanPath)
+  return 1
+end function
+
+appendManagedOutputCleanupTargets = function(filePaths, fileSeen, dirPaths, dirSeen, baseDir)
+  cleanBaseDir = norm(baseDir)
+  if cleanBaseDir == "" then return 0
+
+  outputFileNames = [
+    "crs_v1_report.txt",
+    SESSION_REPORT_FILE,
+    "crs_v1_host_cache.tsv",
+    "crs_v1_credential_cache.tsv",
+    "crs_v1_signature_cache.tsv",
+    "crs_v1_surface_cache.tsv",
+    "crs_v1_loot_cache.tsv",
+    WORKER_MANIFEST_FILE,
+  ]
+
+  for fileName in outputFileNames
+    addUniquePathValue(filePaths, fileSeen, cleanBaseDir + "/" + fileName)
+  end for
+
+  managedOutputDir = buildManagedOutputDirPath(cleanBaseDir)
+  if managedOutputDir == "" or managedOutputDir == cleanBaseDir then return 0
+
+  for fileName in outputFileNames
+    addUniquePathValue(filePaths, fileSeen, managedOutputDir + "/" + fileName)
+  end for
+  addUniquePathValue(dirPaths, dirSeen, managedOutputDir)
+  return 1
+end function
+
+containsCredentialKeyword = function(textValue)
+  lowered = normalizeInput(textValue).trim.lower
+  if lowered == "" then return 0
+
+  for keyword in CREDENTIAL_KEYWORDS
+    if lowered.indexOf(keyword) != null then return 1
+  end for
+
+  return 0
+end function
+
+isTokenChar = function(ch)
+  if ch == null or ch == "" then return 0
+  return TOKEN_CHARS.indexOf(ch) != null
+end function
+
+extractTokens = function(textValue, minLen = 3)
+  tokens = []
+  current = ""
+
+  for ch in normalizeText(textValue)
+    if isTokenChar(ch) then
+      current = current + ch
+    else
+      if current.len >= minLen then tokens.push(current)
+      current = ""
+    end if
+  end for
+
+  if current.len >= minLen then tokens.push(current)
+  return tokens
+end function
+
+listReadableUserHomes = function(remoteComputer)
+  users = []
+  homeFolder = remoteComputer.File("/home")
+  if homeFolder == null then return users
+  if not homeFolder.is_folder then return users
+  if not homeFolder.has_permission("r") then return users
+
+  subFolders = homeFolder.get_folders
+  if subFolders == null then return users
+
+  for subFolder in subFolders
+    if subFolder == null then continue
+    if not subFolder.is_folder then continue
+    if not subFolder.has_permission("r") then continue
+    users.push(pathBaseName(subFolder.path))
+  end for
+
+  return users
+end function
+
+collectCredentialUsers = function(remoteComputer, targetUser = "", runtimeContext = null)
+  users = []
+  seen = []
+
+  pushUniqueString(users, seen, DEFAULT_ROOT_BOOTSTRAP_USER)
+  if targetUser != "" then pushUniqueString(users, seen, targetUser)
+  if runtimeContext != null and runtimeContext.computer != null and isSameComputer(runtimeContext.computer, remoteComputer) then
+    activeUserText = normalizeInput(runtimeContext.active_user).trim
+    if activeUserText != "" then pushUniqueString(users, seen, activeUserText)
+  end if
+
+  passwdFile = remoteComputer.File("/etc/passwd")
+  passwdContent = readTextFile(passwdFile)
+  if passwdContent != null and passwdContent != "" then
+    for line in passwdContent.split(NL)
+      cleanLine = normalizeInput(line).trim
+      if cleanLine == "" then continue
+      parts = cleanLine.split(":")
+      if parts == null or parts.len == 0 then continue
+      pushUniqueString(users, seen, parts[0])
+    end for
+  end if
+
+  for userName in listReadableUserHomes(remoteComputer)
+    pushUniqueString(users, seen, userName)
+  end for
+
+  return users
+end function
+
+pushPotentialUserName = function(users, seen, rawValue)
+  candidateValue = normalizeText(rawValue).trim
+  if candidateValue == "" then return 0
+
+  if candidateValue.indexOf("@") != null then candidateValue = candidateValue.split("@")[0]
+  if candidateValue.indexOf(" ") != null then candidateValue = candidateValue.split(" ")[0]
+  if candidateValue.indexOf(":") != null then candidateValue = candidateValue.split(":")[0]
+
+  candidateValue = normalizeText(candidateValue).trim
+  if candidateValue == "" then return 0
+  return pushUniqueString(users, seen, candidateValue)
+end function
+
+collectSmtpEnumeratedUsers = function(crypto, localShell, remoteComputer, users, notes = null)
+  if crypto == null then return 0
+  if remoteComputer == null then return 0
+  if not computerHasOpenPort(remoteComputer, 25) then return 0
+
+  addresses = buildRemoteLoginAddresses(localShell, remoteComputer)
+  if addresses == null or addresses.len == 0 then return 0
+
+  seen = []
+  for existingUser in users
+    cleanUser = normalizeInput(existingUser).trim
+    if cleanUser == "" then continue
+    if listHasValue(seen, cleanUser) then continue
+    seen.push(cleanUser)
+  end for
+
+  added = 0
+  for address in addresses
+    if address == "" then continue
+
+    smtpUsers = crypto.smtp_user_list(address, 25)
+    if smtpUsers == null then continue
+    if smtpUsers isa string then
+      if notes != null and normalizeInput(smtpUsers).trim != "" then appendLine(notes, "SMTP enumeration note on " + address + ": " + normalizeInput(smtpUsers).trim)
+      continue
+    end if
+
+    for smtpUser in smtpUsers
+      added = added + pushPotentialUserName(users, seen, smtpUser)
+    end for
+
+    if notes != null and smtpUsers.len > 0 then appendLine(notes, "SMTP users discovered on " + address + ": " + smtpUsers.len)
+  end for
+
+  return added
+end function
+
+resolveStructuredSecret = function(crypto, rawValue)
+  secretText = normalizeText(rawValue).trim
+  if secretText == "" then return ""
+  if crypto == null then return secretText
+
+  deciphered = crypto.decipher(secretText)
+  decipheredText = normalizeText(deciphered).trim
+  if decipheredText != "" and decipheredText != secretText then return decipheredText
+  return secretText
+end function
+
+addStructuredLootFromHostHints = function(runtimeContext, runState, hostPublicIp, hostLocalIp, file, fallbackUser = "", artifactType = "file")
+  added = 0
+  if runtimeContext == null or runState == null then return added
+  content = readTextFile(file)
+  if content == null or content == "" then return added
+
+  firstLine = ""
+  for line in content.split(NL)
+    firstLine = normalizeText(line).trim
+    if firstLine != "" then break
+  end for
+  if firstLine == "" then return added
+
+  parts = firstLine.split(":")
+  if parts == null or parts.len < 2 then return added
+
+  accountName = normalizeText(parts[0]).trim
+  if accountName == "" then accountName = fallbackUser
+  secretValue = resolveStructuredSecret(runtimeContext.crypto, parts[1])
+  if accountName == "" and secretValue == "" then return added
+
+  added = added + addLootRecord(runState, hostPublicIp, hostLocalIp, fallbackUser, artifactType, accountName, secretValue, file.path)
+  return added
+end function
+
+addStructuredLootFromFile = function(runtimeContext, runState, remoteComputer, file, fallbackUser = "", artifactType = "file")
+  if remoteComputer == null then return 0
+  return addStructuredLootFromHostHints(runtimeContext, runState, remoteComputer.public_ip, remoteComputer.local_ip, file, fallbackUser, artifactType)
+end function
+
+addPasswdLootFromFile = function(runtimeContext, runState, hostPublicIp, hostLocalIp, passwdFile, sourceText = "passwd-file")
+  outcome = {
+    "added": 0,
+    "credential_records": 0,
+    "users": 0,
+  }
+
+  if runtimeContext == null or runState == null then return outcome
+
+  passwdContent = readTextFile(passwdFile)
+  if passwdContent == null or passwdContent == "" then return outcome
+
+  for line in passwdContent.split(NL)
+    userLine = normalizeText(line).trim
+    if userLine == "" then continue
+    userParts = userLine.split(":")
+    if userParts == null or userParts.len < 2 then continue
+
+    userName = normalizeText(userParts[0]).trim
+    if userName == "" then continue
+
+    secretValue = resolveStructuredSecret(runtimeContext.crypto, userParts[1])
+    if addLootRecord(runState, hostPublicIp, hostLocalIp, userName, "passwd", userName, secretValue, passwdFile.path) then
+      outcome.added = outcome.added + 1
+    end if
+
+    if secretValue != "" and secretValue.len >= 3 then
+      if addCredentialCacheRecord(runState.credential_cache, hostPublicIp, hostLocalIp, userName, secretValue, sourceText) then
+        outcome.credential_records = outcome.credential_records + 1
+      end if
+    end if
+
+    outcome.users = outcome.users + 1
+  end for
+
+  return outcome
+end function
+
+collectStructuredLoot = function(runtimeContext, remoteComputer, targetContext, runState)
+  outcome = {
+    "status": "not-run",
+    "records": [],
+    "scanned_files": 0,
+    "added": 0,
+    "notes": [],
+  }
+
+  if runtimeContext == null or runState == null then
+    outcome.status = "missing-state"
+    return outcome
+  end if
+
+  if not runState.config.loot_mode then
+    outcome.status = "disabled"
+    return outcome
+  end if
+
+  if remoteComputer == null then
+    outcome.status = "missing-computer"
+    return outcome
+  end if
+
+  passwdFile = remoteComputer.File("/etc/passwd")
+  passwdOutcome = addPasswdLootFromFile(runtimeContext, runState, remoteComputer.public_ip, remoteComputer.local_ip, passwdFile, "structured-loot-passwd")
+  if passwdOutcome.users > 0 then
+    outcome.scanned_files = outcome.scanned_files + 1
+    outcome.added = outcome.added + passwdOutcome.added
+  end if
+
+  homeFolder = remoteComputer.File("/home")
+  if homeFolder != null and homeFolder.is_folder and homeFolder.has_permission("r") then
+    for userFolder in homeFolder.get_folders
+      yield
+      if userFolder == null then continue
+      if not userFolder.is_folder then continue
+
+      userName = normalizeText(userFolder.name).trim
+      if targetContext != null and normalizeInput(targetContext.target_user).trim != "" then
+        if userName.lower != normalizeInput(targetContext.target_user).trim.lower and userName.lower != "guest" then
+          // Keep the target user and guest by default when a specific user was requested.
+          continue
+        end if
+      end if
+
+      for artifact in [{"type":"mail", "path":"/home/" + userName + "/Config/Mail.txt"}, {"type":"bank", "path":"/home/" + userName + "/Config/Bank.txt"}]
+        file = remoteComputer.File(artifact.path)
+        if file == null then continue
+        outcome.scanned_files = outcome.scanned_files + 1
+        outcome.added = outcome.added + addStructuredLootFromFile(runtimeContext, runState, remoteComputer, file, userName, artifact.type)
+      end for
+    end for
+  end if
+
+  rootConfigFolder = remoteComputer.File("/root/Config")
+  if rootConfigFolder != null and rootConfigFolder.is_folder and rootConfigFolder.has_permission("r") then
+    for artifact in [{"type":"mail", "path":"/root/Config/Mail.txt"}, {"type":"bank", "path":"/root/Config/Bank.txt"}]
+      file = remoteComputer.File(artifact.path)
+      if file == null then continue
+      outcome.scanned_files = outcome.scanned_files + 1
+      outcome.added = outcome.added + addStructuredLootFromFile(runtimeContext, runState, remoteComputer, file, "root", artifact.type)
+    end for
+  end if
+
+  for lootRecord in runState.loot_records
+    if lootRecord == null then continue
+    if normalizeInput(lootRecord.host_public).trim != normalizeInput(remoteComputer.public_ip).trim then continue
+    if normalizeInput(lootRecord.host_local).trim != normalizeInput(remoteComputer.local_ip).trim then continue
+    outcome.records.push(lootRecord)
+  end for
+
+  outcome.status = "complete"
+  appendLine(outcome.notes, "Structured loot records: " + outcome.records.len)
+  appendLine(outcome.notes, "Structured loot files scanned: " + outcome.scanned_files)
+  return outcome
+end function
+
+lootRecordMatchesMissionAction = function(lootRecord, missionActionMode)
+  if lootRecord == null then return 0
+  actionMode = normalizeMissionActionMode(missionActionMode, "loot")
+  if actionMode == "off" then return 0
+  if actionMode == "loot" or actionMode == "all" then return 1
+  return normalizeInput(lootRecord.artifact_type).trim.lower == actionMode
+end function
+
+collectMissionLootRecords = function(runState, remoteComputer, missionActionMode)
+  records = []
+  if runState == null then return records
+  if remoteComputer == null then return records
+  if runState.loot_records == null then return records
+
+  remotePublicIp = normalizeInput(remoteComputer.public_ip).trim
+  remoteLocalIp = normalizeInput(remoteComputer.local_ip).trim
+
+  for lootRecord in runState.loot_records
+    if lootRecord == null then continue
+    if normalizeInput(lootRecord.host_public).trim != remotePublicIp then continue
+    if normalizeInput(lootRecord.host_local).trim != remoteLocalIp then continue
+    if not lootRecordMatchesMissionAction(lootRecord, missionActionMode) then continue
+    records.push(lootRecord)
+  end for
+
+  return records
+end function
+
+pushPasswordCandidate = function(candidates, seen, rawValue, sourceText)
+  candidateValue = normalizeText(rawValue).trim
+  if candidateValue == "" then return 0
+  if candidateValue.len < 3 then return 0
+  if candidateValue.len > 64 then return 0
+  if listHasValue(seen, candidateValue) then return 0
+
+  seen.push(candidateValue)
+  candidates.push({
+    "value": candidateValue,
+    "source": normalizeInput(sourceText).trim,
+  })
+  return 1
+end function
+
+addPasswordCandidateVariants = function(crypto, candidates, seen, rawValue, sourceText)
+  added = pushPasswordCandidate(candidates, seen, rawValue, sourceText)
+
+  if crypto == null then return added
+
+  deciphered = crypto.decipher(normalizeText(rawValue).trim)
+  decipheredText = normalizeText(deciphered).trim
+  if decipheredText != "" and decipheredText != normalizeText(rawValue).trim then
+    added = added + pushPasswordCandidate(candidates, seen, decipheredText, sourceText + " [decipher]")
+  end if
+
+  return added
+end function
+
+collectPasswordCandidatesFromLine = function(crypto, candidates, seen, lineText, sourceText, targetUser = "", maxCandidates = MAX_CREDENTIAL_CANDIDATES)
+  if candidates.len >= maxCandidates then return 0
+
+  normalizedLine = normalizeText(lineText).trim
+  if normalizedLine == "" then return 0
+
+  lineLower = normalizedLine.lower
+  sourceLower = normalizeInput(sourceText).trim.lower
+  interested = containsCredentialKeyword(sourceLower) or containsCredentialKeyword(lineLower) or sourceLower.indexOf("passwd") != null or sourceLower.indexOf("shadow") != null
+  if targetUser != "" and lineLower.indexOf(targetUser.lower) != null then interested = 1
+  if not interested and normalizedLine.indexOf(":") == null then return 0
+
+  added = 0
+  fields = normalizedLine.split(":")
+  fieldIndex = 0
+  if fields != null and fields.len > 1 then
+    for field in fields
+      if candidates.len >= maxCandidates then return added
+
+      fieldIndex = fieldIndex + 1
+      fieldValue = normalizeInput(field).trim
+      if fieldValue == "" then continue
+      if fieldIndex == 1 then continue
+      added = added + addPasswordCandidateVariants(crypto, candidates, seen, fieldValue, sourceText + " [field " + fieldIndex + "]")
+    end for
+  end if
+
+  for token in extractTokens(normalizedLine, 4)
+    if candidates.len >= maxCandidates then return added
+    added = added + addPasswordCandidateVariants(crypto, candidates, seen, token, sourceText + " [token]")
+  end for
+
+  return added
+end function
+
+collectPasswordCandidatesFromFile = function(crypto, file, candidates, seen, targetUser = "", maxLines = MAX_CREDENTIAL_LINES, maxCandidates = MAX_CREDENTIAL_CANDIDATES)
+  content = readTextFile(file)
+  if content == null or content == "" then return 0
+
+  added = 0
+  lineNumber = 1
+  for line in content.split(NL)
+    if lineNumber > maxLines then break
+    if candidates.len >= maxCandidates then return added
+
+    added = added + collectPasswordCandidatesFromLine(crypto, candidates, seen, line, file.path + " [line " + lineNumber + "]", targetUser, maxCandidates)
+    lineNumber = lineNumber + 1
+  end for
+
+  return added
+end function
+
+collectPasswordCandidatesFromFolder = function(crypto, folder, candidates, seen, targetUser, stats, depth = 0, maxDepth = 2)
+  if folder == null then return
+  if not folder.is_folder then return
+  if not folder.has_permission("r") then return
+  if depth > maxDepth then return
+  if stats.scanned_files >= stats.max_files then return
+  if candidates.len >= stats.max_candidates then return
+
+  files = folder.get_files
+  if files != null then
+    for file in files
+      yield
+      if stats.scanned_files >= stats.max_files then return
+      if candidates.len >= stats.max_candidates then return
+      if file == null then continue
+
+      stats.scanned_files = stats.scanned_files + 1
+      stats.added = stats.added + collectPasswordCandidatesFromFile(crypto, file, candidates, seen, targetUser, stats.max_lines, stats.max_candidates)
+    end for
+  end if
+
+  subFolders = folder.get_folders
+  if subFolders == null then return
+
+  for subFolder in subFolders
+    yield
+    if stats.scanned_files >= stats.max_files then return
+    if candidates.len >= stats.max_candidates then return
+    collectPasswordCandidatesFromFolder(crypto, subFolder, candidates, seen, targetUser, stats, depth + 1, maxDepth)
+  end for
+end function
+
+collectCredentialIntel = function(runtimeContext, remoteComputer, targetContext, runState = null)
+  intelBundle = {
+    "users": [],
+    "password_candidates": [],
+    "scanned_files": 0,
+    "loot_records": [],
+    "notes": [],
+  }
+
+  if remoteComputer == null then
+    appendLine(intelBundle.notes, "Credential intel skipped: missing remote computer.")
+    return intelBundle
+  end if
+
+  intelBundle.users = collectCredentialUsers(remoteComputer, targetContext.target_user, runtimeContext)
+  collectSmtpEnumeratedUsers(runtimeContext.crypto, runtimeContext.shell, remoteComputer, intelBundle.users, intelBundle.notes)
+  candidateSeen = []
+  stats = {
+    "scanned_files": 0,
+    "added": 0,
+    "max_files": MAX_CREDENTIAL_FILES,
+    "max_lines": MAX_CREDENTIAL_LINES,
+    "max_candidates": MAX_CREDENTIAL_CANDIDATES,
+  }
+
+  stats.added = stats.added + collectPasswordCandidatesFromFile(runtimeContext.crypto, remoteComputer.File("/etc/passwd"), intelBundle.password_candidates, candidateSeen, targetContext.target_user, stats.max_lines, stats.max_candidates)
+  stats.added = stats.added + collectPasswordCandidatesFromFile(runtimeContext.crypto, remoteComputer.File("/etc/shadow"), intelBundle.password_candidates, candidateSeen, targetContext.target_user, stats.max_lines, stats.max_candidates)
+  collectPasswordCandidatesFromFolder(runtimeContext.crypto, remoteComputer.File("/etc"), intelBundle.password_candidates, candidateSeen, targetContext.target_user, stats, 0, 1)
+
+  if targetContext.target_user != "" then
+    collectPasswordCandidatesFromFolder(runtimeContext.crypto, remoteComputer.File("/home/" + targetContext.target_user), intelBundle.password_candidates, candidateSeen, targetContext.target_user, stats, 0, 2)
+  else
+    collectPasswordCandidatesFromFolder(runtimeContext.crypto, remoteComputer.File("/home"), intelBundle.password_candidates, candidateSeen, targetContext.target_user, stats, 0, 1)
+  end if
+
+  collectPasswordCandidatesFromFolder(runtimeContext.crypto, remoteComputer.File("/root/Config"), intelBundle.password_candidates, candidateSeen, targetContext.target_user, stats, 0, 2)
+
+  intelBundle.scanned_files = stats.scanned_files
+  lootBundle = collectStructuredLoot(runtimeContext, remoteComputer, targetContext, runState)
+  intelBundle.loot_records = lootBundle.records
+  if lootBundle.records != null then
+    for lootRecord in lootBundle.records
+      if lootRecord == null then continue
+      addPasswordCandidateVariants(runtimeContext.crypto, intelBundle.password_candidates, candidateSeen, lootRecord.secret, lootRecord.source + " [loot]")
+    end for
+  end if
+  intelBundle.scanned_files = intelBundle.scanned_files + lootBundle.scanned_files
+  for noteLine in lootBundle.notes
+    appendLine(intelBundle.notes, noteLine)
+  end for
+  appendLine(intelBundle.notes, "Credential users discovered: " + intelBundle.users.len)
+  appendLine(intelBundle.notes, "Credential password candidates: " + intelBundle.password_candidates.len)
+  appendLine(intelBundle.notes, "Credential files scanned: " + intelBundle.scanned_files)
+  return intelBundle
+end function
+
+getAttackResultComputer = function(attackResult)
+  if attackResult == null then return null
+  if attackResult.result == null then return null
+
+  resultType = normLower(attackResult.result_type)
+  if resultType == "computer" then return attackResult.result
+  if resultType == "shell" or resultType == "ftp" then return attackResult.result.host_computer
+  return null
+end function
+
+hostRecordHasPort = function(hostRecord, portNumber)
+  if hostRecord == null then return 0
+  if hostRecord.open_ports == null then return 0
+
+  for portInfo in hostRecord.open_ports
+    if portInfo == null then continue
+    if portInfo.port == portNumber then return 1
+  end for
+
+  return 0
+end function
+
+buildHostRecordLoginAddresses = function(localShell, hostRecord)
+  addresses = []
+  seen = []
+  if hostRecord == null then return addresses
+
+  if localShell != null then
+    currentComputer = localShell.host_computer
+    if currentComputer != null then
+      currentPublicIp = normalizeInput(currentComputer.public_ip).trim
+      targetPublicIp = normalizeInput(hostRecord.public_ip).trim
+      targetLanIp = normalizeInput(hostRecord.lan_ip).trim
+      if currentPublicIp != "" and targetPublicIp != "" and currentPublicIp == targetPublicIp and targetLanIp != "" then
+        pushUniqueString(addresses, seen, targetLanIp)
+      end if
+    end if
+  end if
+
+  pushUniqueString(addresses, seen, hostRecord.ip)
+  pushUniqueString(addresses, seen, hostRecord.public_ip)
+  pushUniqueString(addresses, seen, hostRecord.lan_ip)
+  return addresses
+end function
+
+buildCredentialReuseTargets = function(rankedHosts, selectedHostRecord, sourceComputer = null)
+  targets = []
+  seen = []
+  referencePublicIp = ""
+  referenceGatewayIp = ""
+
+  if selectedHostRecord != null then
+    addUniqueHostRecord(targets, seen, selectedHostRecord)
+    referencePublicIp = normalizeInput(selectedHostRecord.public_ip).trim
+    referenceGatewayIp = normalizeInput(selectedHostRecord.gateway_ip).trim
+  end if
+
+  if sourceComputer != null then
+    if referencePublicIp == "" then referencePublicIp = normalizeInput(sourceComputer.public_ip).trim
+  end if
+
+  if rankedHosts == null then return targets
+
+  for hostRecord in rankedHosts
+    if hostRecord == null then continue
+
+    if referencePublicIp != "" then
+      hostPublicIp = normalizeInput(hostRecord.public_ip).trim
+      if hostPublicIp != "" and hostPublicIp != referencePublicIp then continue
+    end if
+
+    if referenceGatewayIp != "" then
+      hostGatewayIp = normalizeInput(hostRecord.gateway_ip).trim
+      hostIp = normalizeInput(hostRecord.ip).trim
+      if hostGatewayIp != "" and hostGatewayIp != referenceGatewayIp and hostIp != referenceGatewayIp then continue
+    end if
+
+    addUniqueHostRecord(targets, seen, hostRecord)
+  end for
+
+  return targets
+end function
+
+buildCredentialUserOrder = function(users, targetUser = "")
+  ordered = []
+  seen = []
+
+  pushUniqueString(ordered, seen, DEFAULT_ROOT_BOOTSTRAP_USER)
+  if targetUser != "" then pushUniqueString(ordered, seen, targetUser)
+
+  if users != null then
+    for userName in users
+      pushUniqueString(ordered, seen, userName)
+    end for
+  end if
+
+  return ordered
+end function
+
+buildKnownCredentialUser = function(runState)
+  if runState == null or runState.config == null then return ""
+
+  knownUser = norm(runState.config.known_user)
+  if knownUser != "" then return knownUser
+  return norm(runState.target.target_user)
+end function
+
+credentialCacheScopeScore = function(cacheRecord, hostRecord)
+  if cacheRecord == null then return 0
+  if hostRecord == null then return 0
+
+  cachePublicIp = norm(cacheRecord.host_public)
+  cacheLocalIp = norm(cacheRecord.host_local)
+  hostPublicIp = norm(hostRecord.public_ip)
+  hostLocalIp = norm(hostRecord.lan_ip)
+  if hostLocalIp == "" and is_lan_ip(hostRecord.ip) then hostLocalIp = norm(hostRecord.ip)
+
+  if cacheLocalIp != "" and hostLocalIp != "" and cacheLocalIp == hostLocalIp then return 2
+  if cachePublicIp != "" and hostPublicIp != "" and cachePublicIp == hostPublicIp then return 1
+  return 0
+end function
+
+buildScopedCredentialCacheRecords = function(cacheData, hostRecord)
+  exactMatches = []
+  chainMatches = []
+  if cacheData == null or cacheData.records == null then return chainMatches
+  if hostRecord == null then return chainMatches
+
+  for cacheRecord in cacheData.records
+    if cacheRecord == null then continue
+
+    scopeScore = credentialCacheScopeScore(cacheRecord, hostRecord)
+    if scopeScore >= 1 then chainMatches.push(cacheRecord)
+    if scopeScore >= 2 then exactMatches.push(cacheRecord)
+  end for
+
+  if exactMatches.len > 0 then return exactMatches
+  return chainMatches
+end function
+
+tryCredentialHostRecordAccess = function(localShell, hostRecord, userName, passwordValue)
+  if localShell == null then return null
+  if hostRecord == null then return null
+
+  addresses = buildHostRecordLoginAddresses(localShell, hostRecord)
+  if addresses == null or addresses.len == 0 then return null
+
+  if hostRecordHasPort(hostRecord, 22) then
+    for address in addresses
+      connection = localShell.connect_service(address, 22, userName, passwordValue, "ssh")
+      if connection == null then continue
+      if isTerminalAccessType(loginAccessType(connection)) then return connection
+    end for
+  end if
+
+  return null
+end function
+
+attemptCredentialReuse = function(runtimeContext, runState, attackResult)
+  outcome = {
+    "status": "not-run",
+    "shell": null,
+    "host_ip": "",
+    "user": "",
+    "source_host": "",
+    "attempts": 0,
+    "successes": 0,
+    "scanned_files": 0,
+    "password_candidates": 0,
+    "loot_records": 0,
+    "notes": [],
+  }
+
+  if runState != null and runState.config != null and runState.config.skip_credential_reuse then
+    outcome.status = "disabled"
+    appendLine(outcome.notes, "Credential reuse skipped by configuration.")
+    return outcome
+  end if
+
+  if hasAcceptedNonGuestShell(runState) then
+    outcome.status = "skipped-existing-shell"
+    appendLine(outcome.notes, "Credential reuse skipped because an accepted non-guest shell is already available.")
+    return outcome
+  end if
+
+  sourceComputer = getAttackResultComputer(attackResult)
+  if sourceComputer != null then
+    outcome.source_host = formatValueDisplay(sourceComputer.public_ip) + " / " + formatValueDisplay(sourceComputer.local_ip)
+  end if
+
+  targets = buildCredentialReuseTargets(runState.ranked_hosts, runState.selected_host_record, sourceComputer)
+  exactTargetRecord = findExactTargetHostRecord(runState.ranked_hosts, runState.target)
+  sourceHostRecord = findHostRecordForComputer(runState.ranked_hosts, sourceComputer)
+  if exactTargetRecord != null and sourceHostRecord != null then
+    if norm(sourceHostRecord.ip) == norm(exactTargetRecord.ip) then
+      targets = [exactTargetRecord]
+      appendLine(outcome.notes, "Exact target foothold obtained; restricting credential reuse to same host.")
+    end if
+  end if
+  if targets.len == 0 then
+    outcome.status = "no-targets"
+    return outcome
+  end if
+
+  intelBundle = {
+    "users": [],
+    "password_candidates": [],
+    "scanned_files": 0,
+    "notes": [],
+  }
+  if sourceComputer != null then
+    intelBundle = collectCredentialIntel(runtimeContext, sourceComputer, runState.target, runState)
+    outcome.scanned_files = intelBundle.scanned_files
+    outcome.password_candidates = intelBundle.password_candidates.len
+    outcome.loot_records = intelBundle.loot_records.len
+    for noteLine in intelBundle.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+  end if
+
+  cachedCredentialCount = 0
+  if runState.credential_cache != null and runState.credential_cache.records != null then cachedCredentialCount = runState.credential_cache.records.len
+  knownUser = buildKnownCredentialUser(runState)
+  knownPass = ""
+  if runState != null and runState.config != null then knownPass = norm(runState.config.known_pass)
+  hasKnownCredential = knownUser != "" and knownPass != ""
+
+  if cachedCredentialCount == 0 and intelBundle.password_candidates.len == 0 and not hasKnownCredential then
+    outcome.status = "no-credentials"
+    appendLine(outcome.notes, "No cached or discovered credentials available.")
+    return outcome
+  end if
+
+  orderedUsers = buildCredentialUserOrder(intelBundle.users, runState.target.target_user)
+
+  for hostRecord in targets
+    yield
+    if hostRecord == null then continue
+    if not hostRecordHasPort(hostRecord, 22) then continue
+
+    if hasKnownCredential then
+      attemptKey = norm(hostRecord.ip) + TAB + knownUser + TAB + knownPass
+      if not runState.credential_attempt_keys.hasIndex(attemptKey) then
+        if outcome.attempts >= MAX_CREDENTIAL_ATTEMPTS then
+          outcome.status = "attempt-limit"
+          appendLine(outcome.notes, "Credential attempt limit reached while trying provided credentials.")
+          return outcome
+        end if
+
+        runState.credential_attempt_keys[attemptKey] = 1
+        outcome.attempts = outcome.attempts + 1
+        connection = tryCredentialHostRecordAccess(runtimeContext.shell, hostRecord, knownUser, knownPass)
+        if connection != null then
+          outcome.successes = outcome.successes + 1
+          outcome.status = "known-success"
+          outcome.shell = connection
+          outcome.host_ip = hostRecord.ip
+          outcome.user = knownUser
+          recordAcceptedTerminalAccess(connection, hostRecord, runState)
+          appendLine(outcome.notes, "Provided credential success: " + knownUser + " @ " + hostRecord.ip)
+          addCredentialCacheRecord(runState.credential_cache, hostRecord.public_ip, hostRecord.lan_ip, knownUser, knownPass, "known-credential")
+          return outcome
+        end if
+      end if
+    end if
+
+    scopedCacheRecords = buildScopedCredentialCacheRecords(runState.credential_cache, hostRecord)
+
+    for priorityPass in [0, 1, 2]
+      for cacheRecord in scopedCacheRecords
+        yield
+        if cacheRecord == null then continue
+
+        cacheUser = normalizeInput(cacheRecord.user).trim
+        targetUser = normalizeInput(runState.target.target_user).trim.lower
+        if priorityPass == 0 and cacheUser.lower != DEFAULT_ROOT_BOOTSTRAP_USER then continue
+        if priorityPass == 1 and (targetUser == "" or targetUser == DEFAULT_ROOT_BOOTSTRAP_USER or cacheUser.lower != targetUser) then continue
+        if priorityPass == 2 then
+          if cacheUser.lower == DEFAULT_ROOT_BOOTSTRAP_USER then continue
+          if targetUser != "" and cacheUser.lower == targetUser then continue
+        end if
+
+        attemptKey = normalizeInput(hostRecord.ip).trim + TAB + cacheUser + TAB + normalizeInput(cacheRecord.password).trim
+        if runState.credential_attempt_keys.hasIndex(attemptKey) then continue
+        if outcome.attempts >= MAX_CREDENTIAL_ATTEMPTS then
+          outcome.status = "attempt-limit"
+          appendLine(outcome.notes, "Credential attempt limit reached while replaying cached credentials.")
+          return outcome
+        end if
+
+        runState.credential_attempt_keys[attemptKey] = 1
+        outcome.attempts = outcome.attempts + 1
+        connection = tryCredentialHostRecordAccess(runtimeContext.shell, hostRecord, cacheUser, cacheRecord.password)
+        if connection == null then continue
+
+        outcome.successes = outcome.successes + 1
+        outcome.status = "cache-success"
+        outcome.shell = connection
+        outcome.host_ip = hostRecord.ip
+        outcome.user = cacheUser
+        recordAcceptedTerminalAccess(connection, hostRecord, runState)
+        appendLine(outcome.notes, "Cached credential success: " + cacheUser + " @ " + hostRecord.ip)
+        addCredentialCacheRecord(runState.credential_cache, hostRecord.public_ip, hostRecord.lan_ip, cacheUser, cacheRecord.password, "cache-replay")
+        return outcome
+      end for
+    end for
+
+    for userName in orderedUsers
+      for candidate in intelBundle.password_candidates
+        yield
+        if candidate == null then continue
+        if outcome.attempts >= MAX_CREDENTIAL_ATTEMPTS then
+          outcome.status = "attempt-limit"
+          appendLine(outcome.notes, "Credential attempt limit reached while trying discovered candidates.")
+          return outcome
+        end if
+
+        attemptKey = normalizeInput(hostRecord.ip).trim + TAB + normalizeInput(userName).trim + TAB + normalizeInput(candidate.value).trim
+        if runState.credential_attempt_keys.hasIndex(attemptKey) then continue
+
+        runState.credential_attempt_keys[attemptKey] = 1
+        outcome.attempts = outcome.attempts + 1
+        connection = tryCredentialHostRecordAccess(runtimeContext.shell, hostRecord, userName, candidate.value)
+        if connection == null then continue
+
+        outcome.successes = outcome.successes + 1
+        outcome.status = "intel-success"
+        outcome.shell = connection
+        outcome.host_ip = hostRecord.ip
+        outcome.user = userName
+        recordAcceptedTerminalAccess(connection, hostRecord, runState)
+        appendLine(outcome.notes, "Discovered credential success: " + userName + " @ " + hostRecord.ip + " from " + normalizeInput(candidate.source).trim)
+        addCredentialCacheRecord(runState.credential_cache, hostRecord.public_ip, hostRecord.lan_ip, userName, candidate.value, candidate.source)
+        return outcome
+      end for
+    end for
+  end for
+
+  if outcome.attempts == 0 then
+    outcome.status = "no-credential-attempts"
+  else
+    outcome.status = "no-credential-shell"
+  end if
+
+  return outcome
+end function
+
+printCredentialSummary = function(credentialResult)
+  if credentialResult == null then return
+
+  print("CRS V1 credential summary")
+  print("Status: " + formatValueDisplay(credentialResult.status))
+  print("Source host: " + formatValueDisplay(credentialResult.source_host))
+  print("Attempts: " + credentialResult.attempts)
+  print("Successes: " + credentialResult.successes)
+  print("Password candidates: " + credentialResult.password_candidates)
+  print("Files scanned: " + credentialResult.scanned_files)
+  if credentialResult.loot_records != null then print("Loot records: " + credentialResult.loot_records)
+  if credentialResult.host_ip != "" then print("Credential host: " + credentialResult.host_ip)
+  if credentialResult.user != "" then print("Credential user: " + credentialResult.user)
+  print("")
+end function
+

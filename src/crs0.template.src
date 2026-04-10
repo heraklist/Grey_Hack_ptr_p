@@ -1,0 +1,7 @@
+// CRS main entrypoint template
+// Replace every __CRS_ROOT__ literal with the absolute in-game folder that will hold
+// crs0.src, crs_core.src, crs_post.src, and crs_attack.src.
+
+import_code("__CRS_ROOT__/crs_core.src")
+import_code("__CRS_ROOT__/crs_post.src")
+import_code("__CRS_ROOT__/crs_attack.src")

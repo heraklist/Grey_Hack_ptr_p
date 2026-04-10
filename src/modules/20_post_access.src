@@ -1,0 +1,1968 @@
+// CRS module 20: staging, local recon, handoff, finalization, cleanup.
+
+getAccessHostComputer = function(accessObject)
+  if accessObject == null then return null
+  accessType = loginAccessType(accessObject)
+  if not isCredentialAccessType(accessType) then return null
+  return accessObject.host_computer
+end function
+
+findHostRecordForComputer = function(hostRecords, remoteComputer)
+  if hostRecords == null then return null
+  if remoteComputer == null then return null
+
+  remotePublicIp = norm(remoteComputer.public_ip)
+  remoteLocalIp = norm(remoteComputer.local_ip)
+
+  for hostRecord in hostRecords
+    if hostRecord == null then continue
+
+    recordPublicIp = norm(hostRecord.public_ip)
+    recordLocalIp = norm(hostRecord.lan_ip)
+    if recordLocalIp == "" then recordLocalIp = norm(hostRecord.ip)
+
+    if remoteLocalIp != "" and recordLocalIp != "" and remoteLocalIp == recordLocalIp then return hostRecord
+  end for
+
+  for hostRecord in hostRecords
+    if hostRecord == null then continue
+
+    recordPublicIp = norm(hostRecord.public_ip)
+    if remotePublicIp != "" and recordPublicIp != "" and remotePublicIp == recordPublicIp then return hostRecord
+  end for
+
+  return null
+end function
+
+findWritableDeployFolder = function(remoteComputer)
+  candidatePaths = ["/tmp", "/var/tmp", "/home/guest", "/home"]
+
+  for candidatePath in candidatePaths
+    folder = remoteComputer.File(candidatePath)
+    if folder == null then continue
+    if not folder.is_folder then continue
+    if folder.has_permission("w") then return candidatePath
+  end for
+
+  homeFolder = remoteComputer.File("/home")
+  if homeFolder != null and homeFolder.is_folder and homeFolder.has_permission("r") then
+    for userFolder in homeFolder.get_folders
+      if userFolder == null then continue
+      if not userFolder.is_folder then continue
+      if userFolder.has_permission("w") then return userFolder.path
+    end for
+  end if
+
+  return ""
+end function
+
+copyOptionalAsset = function(localShell, remoteShell, localPath, remoteDir)
+  if localShell == null then return 0
+  localComputer = localShell.host_computer
+  if localComputer == null then return 0
+
+  localFile = localComputer.File(localPath)
+  if localFile == null then return 0
+  if localFile.is_folder then return 0
+
+  copyResult = localShell.scp(localPath, remoteDir, remoteShell)
+  if copyResult == 1 then return 1
+  return 0
+end function
+
+copyAnyOptionalAsset = function(localShell, remoteShell, localPaths, remoteDir)
+  if localPaths == null then return 0
+
+  for localPath in localPaths
+    if localPath == null then continue
+    if norm(localPath) == "" then continue
+    if copyOptionalAsset(localShell, remoteShell, localPath, remoteDir) then return 1
+  end for
+
+  return 0
+end function
+
+buildLocalLpeAssetCandidates = function(runState)
+  candidates = []
+  seen = {}
+  if runState == null or runState.runtime == null then return candidates
+
+  programDir = pathParentDir(runState.runtime.program_path)
+  if programDir != "" then addUniquePathValue(candidates, seen, programDir + "/" + DEFAULT_LPE_WORKER_NAME)
+
+  currentDir = norm(runState.runtime.current_path)
+  if currentDir != "" then addUniquePathValue(candidates, seen, currentDir + "/" + DEFAULT_LPE_WORKER_NAME)
+
+  homeDir = norm(runState.runtime.home_dir)
+  if homeDir != "" then addUniquePathValue(candidates, seen, homeDir + "/" + DEFAULT_LPE_WORKER_NAME)
+
+  if runState.config != null then
+    sharedDir = norm(runState.config.shared_dir)
+    if sharedDir != "" then addUniquePathValue(candidates, seen, sharedDir + "/" + DEFAULT_LPE_WORKER_NAME)
+  end if
+
+  return candidates
+end function
+
+clearLpeStatus = function(remoteComputer, ipc = null)
+  if ipc != null then ipc.lpe_status = ""
+  if remoteComputer == null then return 0
+
+  statusFile = remoteComputer.File(LPE_STATUS_FILE)
+  if statusFile == null then return 0
+  if statusFile.is_folder then return 0
+  if not statusFile.has_permission("w") then return 0
+
+  deleteResult = statusFile.delete
+  if isError(deleteResult) then return 0
+  return 1
+end function
+
+readLpeStatus = function(remoteComputer, ipc = null)
+  if ipc != null and ipc.hasIndex("lpe_status") then
+    ipcStatus = normLower(ipc.lpe_status)
+    if ipcStatus == "success" or ipcStatus == "partial" or ipcStatus == "failed" then return ipcStatus
+  end if
+
+  if remoteComputer == null then return ""
+
+  statusText = normLower(readTextFile(remoteComputer.File(LPE_STATUS_FILE)))
+  if statusText == "success" or statusText == "partial" or statusText == "failed" then return statusText
+  return ""
+end function
+
+findStagedLpeWorkerPath = function(runState, hostKey)
+  if runState == null then return ""
+
+  normalizedHostKey = normalizeCacheField(hostKey)
+  for stagedEntry in runState.staged_paths
+    if stagedEntry == null then continue
+    if stagedEntry.host_key != normalizedHostKey then continue
+
+    stagedPath = norm(stagedEntry.path)
+    if stagedPath == "" then continue
+    if normLower(stagedEntry.type) == "lpe" then return stagedPath
+    if normLower(pathBaseName(stagedPath)) == normLower(DEFAULT_LPE_WORKER_NAME) then return stagedPath
+  end for
+
+  return ""
+end function
+
+deliverAndLaunchLpeWorker = function(runState, accessObject, remoteComputer)
+  outcome = {
+    "status": "not-run",
+    "remote_dir": "",
+    "remote_path": "",
+    "ipc": null,
+    "notes": [],
+  }
+
+  if runState == null then
+    outcome.status = "missing-state"
+    return outcome
+  end if
+
+  if accessObject == null then
+    outcome.status = "missing-access"
+    return outcome
+  end if
+
+  if loginAccessType(accessObject) != "shell" then
+    outcome.status = "not-shell"
+    return outcome
+  end if
+
+  if remoteComputer == null then
+    outcome.status = "missing-computer"
+    return outcome
+  end if
+
+  hostKey = buildHostKey(remoteComputer.public_ip, remoteComputer.local_ip)
+  remotePath = findStagedLpeWorkerPath(runState, hostKey)
+  remoteDir = pathParentDir(remotePath)
+
+  if remotePath == "" then
+    remoteDir = findWritableDeployFolder(remoteComputer)
+    if remoteDir == "" then
+      outcome.status = "no-remote-dir"
+      appendLine(outcome.notes, "No writable remote folder found for LPE worker delivery.")
+      return outcome
+    end if
+
+    lpeCandidates = buildLocalLpeAssetCandidates(runState)
+    if not copyAnyOptionalAsset(runState.runtime.shell, accessObject, lpeCandidates, remoteDir) then
+      outcome.status = "missing-lpe-worker"
+      appendLine(outcome.notes, "No compiled LPE worker found for delivery.")
+      return outcome
+    end if
+
+    remotePath = remoteDir + "/" + DEFAULT_LPE_WORKER_NAME
+    if remoteComputer.File(remotePath) == null then
+      outcome.status = "validation-failed"
+      appendLine(outcome.notes, "Remote LPE worker validation failed after delivery.")
+      return outcome
+    end if
+
+    addStagedArtifact(runState, hostKey, remotePath, "lpe")
+  end if
+
+  ipc = get_custom_object()
+  outcome.ipc = ipc
+  clearLpeStatus(remoteComputer, ipc)
+
+  launchResult = accessObject.launch(remotePath, "")
+  if launchResult != null and launchResult != 1 then
+    outcome.status = "launch-failed"
+    appendLine(outcome.notes, "LPE worker launch failed: " + normalizeInput(launchResult))
+    return outcome
+  end if
+
+  outcome.status = "launched"
+  outcome.remote_dir = remoteDir
+  outcome.remote_path = remotePath
+  appendLine(outcome.notes, "LPE worker launched from " + remotePath)
+  return outcome
+end function
+
+attemptLocalLpeWorker = function(runState, acceptedAccess, acceptedRecord = null)
+  outcome = {
+    "status": "not-run",
+    "worker_status": "",
+    "shell": null,
+    "access_type": "",
+    "access_level": "",
+    "user": "",
+    "notes": [],
+  }
+
+  if runState == null then
+    outcome.status = "missing-state"
+    return outcome
+  end if
+
+  if acceptedAccess == null then
+    outcome.status = "missing-access"
+    return outcome
+  end if
+
+  if loginAccessType(acceptedAccess) != "shell" then
+    outcome.status = "not-shell"
+    return outcome
+  end if
+
+  remoteComputer = getAccessHostComputer(acceptedAccess)
+  if remoteComputer == null then
+    outcome.status = "missing-computer"
+    return outcome
+  end if
+
+  targetUser = ""
+  if runState.target != null then targetUser = runState.target.target_user
+  currentLevel = classifyTerminalAccessLevel(acceptedAccess, targetUser)
+  outcome.access_level = currentLevel
+  if normLower(currentLevel) == "root" then
+    outcome.status = "already-root"
+    return outcome
+  end if
+
+  existingPersistenceUser = detectComputerUserState(remoteComputer, DEFAULT_PERSISTENCE_BOOTSTRAP_USER)
+  deliverOutcome = deliverAndLaunchLpeWorker(runState, acceptedAccess, remoteComputer)
+  for noteLine in deliverOutcome.notes
+    appendLine(outcome.notes, noteLine)
+  end for
+  if deliverOutcome.status != "launched" then
+    outcome.status = deliverOutcome.status
+    return outcome
+  end if
+
+  finalStatus = ""
+  timeout = 0
+  while timeout < 20
+    finalStatus = readLpeStatus(remoteComputer, deliverOutcome.ipc)
+    if finalStatus != "" then break
+    wait(1)
+    timeout = timeout + 1
+  end while
+
+  if finalStatus == "" then finalStatus = "timeout"
+  outcome.worker_status = finalStatus
+
+  if finalStatus == "timeout" then
+    outcome.status = "worker-timeout"
+    appendLine(outcome.notes, "LPE worker timed out without a final status signal.")
+    return outcome
+  end if
+
+  if finalStatus == "failed" then
+    outcome.status = "worker-failed"
+    appendLine(outcome.notes, "LPE worker reported failure.")
+    return outcome
+  end if
+
+  if finalStatus == "success" then
+    appendLine(outcome.notes, "LPE worker reported success.")
+  else
+    appendLine(outcome.notes, "LPE worker reported partial success.")
+  end if
+
+  persistenceShell = getCredentialShellForComputer(runState.runtime.shell, remoteComputer, DEFAULT_PERSISTENCE_BOOTSTRAP_USER, DEFAULT_PERSISTENCE_BOOTSTRAP_PASSWORD)
+  if persistenceShell == null then
+    if finalStatus == "success" then
+      outcome.status = "lpe-success-no-login"
+      appendLine(outcome.notes, "LPE worker changed the host state, but persistence login did not succeed.")
+    else
+      outcome.status = "lpe-partial"
+      appendLine(outcome.notes, "LPE worker changed the host state, but no stronger shell was obtained.")
+    end if
+    return outcome
+  end if
+
+  outcome.shell = persistenceShell
+  outcome.access_type = loginAccessType(persistenceShell)
+  outcome.access_level = classifyTerminalAccessLevel(persistenceShell, targetUser)
+  outcome.user = DEFAULT_PERSISTENCE_BOOTSTRAP_USER
+
+  hostKey = buildHostKey(remoteComputer.public_ip, remoteComputer.local_ip)
+  if existingPersistenceUser == 0 then addCleanupUserTarget(runState, hostKey, DEFAULT_PERSISTENCE_BOOTSTRAP_USER, 1)
+  addCredentialCacheRecord(runState.credential_cache, remoteComputer.public_ip, remoteComputer.local_ip, DEFAULT_PERSISTENCE_BOOTSTRAP_USER, DEFAULT_PERSISTENCE_BOOTSTRAP_PASSWORD, "lpe-worker")
+  if acceptedRecord != null then recordAcceptedTerminalAccess(persistenceShell, acceptedRecord, runState)
+
+  if finalStatus == "success" then
+    outcome.status = "lpe-shell"
+  else
+    outcome.status = "lpe-partial-shell"
+  end if
+  appendLine(outcome.notes, "Persistence login succeeded after the LPE worker completed.")
+  return outcome
+end function
+
+stageRemoteToolkit = function(runState, accessObject, targetRecord = null, preferredDir = "")
+  outcome = {
+    "status": "not-run",
+    "remote_dir": "",
+    "remote_program": "",
+    "staged_paths": [],
+    "notes": [],
+  }
+
+  if runState == null then
+    outcome.status = "missing-state"
+    return outcome
+  end if
+
+  if not runState.config.stage_tools then
+    outcome.status = "disabled"
+    return outcome
+  end if
+
+  if accessObject == null then
+    outcome.status = "missing-access"
+    return outcome
+  end if
+
+  if loginAccessType(accessObject) != "shell" then
+    outcome.status = "not-shell"
+    return outcome
+  end if
+
+  remoteComputer = getAccessHostComputer(accessObject)
+  if remoteComputer == null then
+    outcome.status = "missing-computer"
+    return outcome
+  end if
+
+  if isSameComputer(runState.runtime.computer, remoteComputer) then
+    outcome.status = "same-host"
+    return outcome
+  end if
+
+  hostKey = buildHostKey(remoteComputer.public_ip, remoteComputer.local_ip)
+  if runState.staged_host_keys.hasIndex(hostKey) then
+    outcome.status = "already-staged"
+    normalizedHostKey = normalizeCacheField(hostKey)
+    for stagedEntry in runState.staged_paths
+      if stagedEntry == null then continue
+      if stagedEntry.host_key != normalizedHostKey then continue
+      outcome.staged_paths.push(stagedEntry.path)
+      if stagedEntry.type == "program" then outcome.remote_program = stagedEntry.path
+    end for
+    if outcome.remote_program != "" then
+      pathParts = outcome.remote_program.split("/")
+      if pathParts != null and pathParts.len > 1 then outcome.remote_dir = pathParts[0:pathParts.len - 1].join("/")
+    end if
+    return outcome
+  end if
+
+  remoteDir = normalizeInput(preferredDir).trim
+  if remoteDir == "" then remoteDir = findWritableDeployFolder(remoteComputer)
+  if remoteDir == "" then
+    outcome.status = "no-remote-dir"
+    appendLine(outcome.notes, "No writable remote folder found for toolkit staging.")
+    return outcome
+  end if
+
+  remoteProgram = remoteDir + "/" + pathBaseName(runState.runtime.program_path)
+  programCopyResult = runState.runtime.shell.scp(runState.runtime.program_path, remoteDir, accessObject)
+  if not isApiSuccess(programCopyResult) then
+    outcome.status = "copy-failed"
+    appendLine(outcome.notes, "Program staging failed: " + normalizeInput(programCopyResult))
+    return outcome
+  end if
+
+  if remoteComputer.File(remoteProgram) == null then
+    outcome.status = "validation-failed"
+    appendLine(outcome.notes, "Remote program validation failed after staging.")
+    return outcome
+  end if
+
+  addStagedArtifact(runState, hostKey, remoteProgram, "program")
+  outcome.remote_dir = remoteDir
+  outcome.remote_program = remoteProgram
+  outcome.staged_paths.push(remoteProgram)
+
+  lpeAssetPaths = buildLocalLpeAssetCandidates(runState)
+  stagedAssets = [
+    {"paths":["/lib/metaxploit.so", runState.config.lib_dir + "/metaxploit.so"], "name":"metaxploit.so", "type":"lib"},
+    {"paths":["/lib/crypto.so", runState.config.lib_dir + "/crypto.so"], "name":"crypto.so", "type":"lib"},
+    {"paths":[runState.outputs.signature_cache_file.path], "name":pathBaseName(runState.outputs.signature_cache_file.path), "type":"cache"},
+    {"paths":[runState.outputs.credential_cache_file.path], "name":pathBaseName(runState.outputs.credential_cache_file.path), "type":"cache"},
+    {"paths":[runState.outputs.host_cache_file.path], "name":pathBaseName(runState.outputs.host_cache_file.path), "type":"cache"},
+    {"paths":[runState.outputs.surface_cache_file.path], "name":pathBaseName(runState.outputs.surface_cache_file.path), "type":"cache"},
+    {"paths":[runState.outputs.loot_cache_file.path], "name":pathBaseName(runState.outputs.loot_cache_file.path), "type":"cache"},
+  ]
+  if lpeAssetPaths != null and lpeAssetPaths.len > 0 then stagedAssets.push({"paths":lpeAssetPaths, "name":DEFAULT_LPE_WORKER_NAME, "type":"lpe"})
+
+  for stagedAsset in stagedAssets
+    if copyAnyOptionalAsset(runState.runtime.shell, accessObject, stagedAsset.paths, remoteDir) then
+      stagedPath = remoteDir + "/" + stagedAsset.name
+      if remoteComputer.File(stagedPath) != null then
+        addStagedArtifact(runState, hostKey, stagedPath, stagedAsset.type)
+        outcome.staged_paths.push(stagedPath)
+      end if
+    end if
+  end for
+
+  runState.staged_toolkit = 1
+  runState.staged_host_keys[hostKey] = 1
+  runState.stage_result = outcome
+  outcome.status = "staged"
+  if targetRecord != null then appendLine(outcome.notes, "Toolkit staged on " + normalizeInput(targetRecord.ip).trim)
+  return outcome
+end function
+
+buildRuntimeHostRecord = function(runtimeContext, seedHostRecord = null)
+  if runtimeContext == null then return seedHostRecord
+  if seedHostRecord != null then return seedHostRecord
+  return {
+    "ip": normalizeInput(runtimeContext.computer.local_ip).trim,
+    "public_ip": normalizeInput(runtimeContext.computer.public_ip).trim,
+    "lan_ip": normalizeInput(runtimeContext.computer.local_ip).trim,
+    "gateway_ip": "",
+    "role": "host",
+    "priority": "medium",
+    "score": 0,
+    "open_ports": [],
+    "source": "runtime-host",
+  }
+end function
+
+dumpExploitSurface = function(targetRecord, runtimeContext, runState, portNumber, remoteLib, memoryAddress, scanInfo, originText = "remote")
+  if runState == null then return 0
+  if not runState.config.surface_report then return 0
+  if remoteLib == null then return 0
+
+  unsafeValues = extractUnsafeValues(scanInfo)
+  if unsafeValues == null or unsafeValues.len == 0 then
+    return addSurfaceRecord(runState, targetRecord, portNumber, remoteLib.lib_name, remoteLib.version, memoryAddress, "", scanInfo, originText)
+  end if
+
+  added = 0
+  for unsafeValue in unsafeValues
+    added = added + addSurfaceRecord(runState, targetRecord, portNumber, remoteLib.lib_name, remoteLib.version, memoryAddress, unsafeValue, scanInfo, originText)
+  end for
+  return added
+end function
+
+buildManualAssistKey = function(portNumber, memoryAddress, unsafeValue)
+  return normalizeCacheField(portNumber) + TAB + normalizeCacheField(memoryAddress) + TAB + normalizeCacheField(unsafeValue)
+end function
+
+buildHostIntelKey = function(hostRecord)
+  if hostRecord == null then return ""
+  hostLocalIp = normalizeInput(hostRecord.lan_ip).trim
+  if hostLocalIp == "" and is_lan_ip(normalizeInput(hostRecord.ip).trim) then hostLocalIp = normalizeInput(hostRecord.ip).trim
+  return buildHostKey(normalizeInput(hostRecord.public_ip).trim, hostLocalIp)
+end function
+
+countLootRecordsForHost = function(runState, hostRecord, artifactType = "")
+  if runState == null then return 0
+  if hostRecord == null then return 0
+  if runState.loot_records == null then return 0
+
+  hostPublicIp = normalizeInput(hostRecord.public_ip).trim
+  hostLocalIp = normalizeInput(hostRecord.lan_ip).trim
+  if hostLocalIp == "" and is_lan_ip(normalizeInput(hostRecord.ip).trim) then hostLocalIp = normalizeInput(hostRecord.ip).trim
+  wantedType = normalizeInput(artifactType).trim.lower
+  matched = 0
+
+  for lootRecord in runState.loot_records
+    if lootRecord == null then continue
+    if hostPublicIp != "" and normalizeInput(lootRecord.host_public).trim != hostPublicIp then continue
+    if hostLocalIp != "" and normalizeInput(lootRecord.host_local).trim != hostLocalIp then continue
+    if wantedType != "" and normalizeInput(lootRecord.artifact_type).trim.lower != wantedType then continue
+    matched = matched + 1
+  end for
+
+  return matched
+end function
+
+countCachedCredentialsForHost = function(runState, hostRecord, userName = "")
+  if runState == null then return 0
+  if hostRecord == null then return 0
+  if runState.credential_cache == null or runState.credential_cache.records == null then return 0
+
+  hostPublicIp = normalizeInput(hostRecord.public_ip).trim
+  hostLocalIp = normalizeInput(hostRecord.lan_ip).trim
+  if hostLocalIp == "" and is_lan_ip(normalizeInput(hostRecord.ip).trim) then hostLocalIp = normalizeInput(hostRecord.ip).trim
+
+  wantedUser = normalizeInput(userName).trim.lower
+  matched = 0
+
+  for cacheRecord in runState.credential_cache.records
+    if cacheRecord == null then continue
+
+    sameHost = 0
+    if hostLocalIp != "" and normalizeInput(cacheRecord.host_local).trim == hostLocalIp then sameHost = 1
+    if not sameHost and hostPublicIp != "" and normalizeInput(cacheRecord.host_public).trim == hostPublicIp then sameHost = 1
+    if not sameHost then continue
+
+    if wantedUser != "" and normalizeInput(cacheRecord.user).trim.lower != wantedUser then continue
+    matched = matched + 1
+  end for
+
+  return matched
+end function
+
+buildLocalIntelScore = function(hostRecord, runState)
+  if hostRecord == null then return -999999
+
+  baseScore = hostPriorityScore(hostRecord, runState.target, runState)
+  lootRecords = countLootRecordsForHost(runState, hostRecord)
+  mailRecords = countLootRecordsForHost(runState, hostRecord, "mail")
+  bankRecords = countLootRecordsForHost(runState, hostRecord, "bank")
+  passwdRecords = countLootRecordsForHost(runState, hostRecord, "passwd")
+  cachedCredentialRecords = countCachedCredentialsForHost(runState, hostRecord)
+  cachedRootRecords = countCachedCredentialsForHost(runState, hostRecord, DEFAULT_ROOT_BOOTSTRAP_USER)
+  cachedTargetUserRecords = 0
+  if runState != null and runState.target != null then
+    cachedTargetUserRecords = countCachedCredentialsForHost(runState, hostRecord, runState.target.target_user)
+  end if
+  openPortCount = 0
+  if hostRecord.open_ports != null then openPortCount = hostRecord.open_ports.len
+
+  return baseScore + (lootRecords * 15) + (mailRecords * 6) + (bankRecords * 8) + (passwdRecords * 4) + (cachedCredentialRecords * 20) + (cachedTargetUserRecords * 40) + (cachedRootRecords * 80) + openPortCount
+end function
+
+storeHostIntelRecord = function(runState, hostRecord, intelRecord)
+  if runState == null then return 0
+  if hostRecord == null then return 0
+  intelKey = buildHostIntelKey(hostRecord)
+  if intelKey == "" then return 0
+  runState.host_intel[intelKey] = intelRecord
+  return 1
+end function
+
+applyLocalIntelToHostRecord = function(hostRecord, intelRecord)
+  if hostRecord == null or intelRecord == null then return 0
+
+  hostRecord["reachable_from_chain"] = intelRecord.reachable_from_chain
+  hostRecord["local_loot_records"] = intelRecord.loot_records
+  hostRecord["local_mail_records"] = intelRecord.mail_records
+  hostRecord["local_bank_records"] = intelRecord.bank_records
+  hostRecord["local_passwd_records"] = intelRecord.passwd_records
+  hostRecord["local_surface_records"] = intelRecord.local_surface_records
+  hostRecord["local_next_hop_score"] = intelRecord.next_hop_score
+  return 1
+end function
+
+collectManualSurfaceEntries = function(runState, targetRecord)
+  entries = []
+  seen = {}
+  if runState == null then return entries
+  if targetRecord == null then return entries
+  if runState.surface_records == null then return entries
+
+  targetIp = normalizeInput(targetRecord.ip).trim
+  targetPublicIp = normalizeInput(targetRecord.public_ip).trim
+  targetLocalIp = normalizeInput(targetRecord.lan_ip).trim
+
+  for record in runState.surface_records
+    if record == null then continue
+    if normalizeInput(record.origin).trim != "remote-service" then continue
+
+    sameHost = 0
+    if normalizeInput(record.host_ip).trim == targetIp then sameHost = 1
+    if not sameHost and targetPublicIp != "" and normalizeInput(record.host_public).trim == targetPublicIp then sameHost = 1
+    if not sameHost and targetLocalIp != "" and normalizeInput(record.host_local).trim == targetLocalIp then sameHost = 1
+    if not sameHost then continue
+
+    unsafeValue = normalizeInput(record.unsafe).trim
+    if unsafeValue == "" then continue
+
+    entryKey = buildManualAssistKey(record.port, record.memory, unsafeValue)
+    if seen.hasIndex(entryKey) then continue
+
+    seen[entryKey] = 1
+    entries.push({
+      "port": normalizeInput(record.port).trim,
+      "lib": normalizeInput(record.lib).trim,
+      "version": normalizeInput(record.version).trim,
+      "memory": normalizeInput(record.memory).trim,
+      "unsafe": unsafeValue,
+      "scan_info": normalizeInput(record.scan_info),
+    })
+  end for
+
+  return entries
+end function
+
+runManualOverflow = function(metaLib, portNumber, routerLanIp, memoryAddress, unsafeValue, extraArg = "")
+  if metaLib == null then return null
+  extraText = normalizeInput(extraArg).trim
+  if extraText != "" then return metaLib.overflow(memoryAddress, unsafeValue, extraText)
+  return runOverflow(metaLib, portNumber, routerLanIp, memoryAddress, unsafeValue)
+end function
+
+manualExploitAssist = function(targetRecord, runtimeContext, runState)
+  outcome = {
+    "status": "",
+    "keep_result": 0,
+    "result": null,
+    "raw_result_type": "",
+    "result_type": "",
+    "escalation_status": "",
+    "selected_port": "",
+    "selected_memory": "",
+    "selected_unsafe": "",
+    "sessions_opened": 0,
+    "overflow_attempts": 0,
+    "notes": [],
+  }
+
+  if runState == null or runtimeContext == null then return outcome
+  if targetRecord == null then return outcome
+  if not runState.config.manual_assist then return outcome
+  if runState.config.non_interactive then
+    outcome.status = "non-interactive"
+    appendLine(outcome.notes, "Manual assist skipped in non-interactive mode.")
+    return outcome
+  end if
+
+  surfaceEntries = collectManualSurfaceEntries(runState, targetRecord)
+  if surfaceEntries == null or surfaceEntries.len == 0 then
+    outcome.status = "no-surface"
+    appendLine(outcome.notes, "Manual assist skipped because no remote-service surface entries are available for this target.")
+    return outcome
+  end if
+
+  enableAnswer = normalizeInput(user_input("Manual exploit assist for " + normalizeInput(targetRecord.ip).trim + "? [y/N]: ")).trim.lower
+  if not toYesNoFlag(enableAnswer, 0) then
+    outcome.status = "skipped"
+    return outcome
+  end if
+
+  displayCount = surfaceEntries.len
+  if displayCount > MAX_MANUAL_ASSIST_OPTIONS then displayCount = MAX_MANUAL_ASSIST_OPTIONS
+
+  print("CRS V1 manual exploit assist")
+  entryIndex = 0
+  for surfaceEntry in surfaceEntries
+    if entryIndex >= displayCount then break
+    print("" + (entryIndex + 1) + ". " + "port=" + surfaceEntry.port + " | " + surfaceEntry.lib + " v" + surfaceEntry.version + " | " + surfaceEntry.memory + " | " + surfaceEntry.unsafe)
+    entryIndex = entryIndex + 1
+  end for
+  if surfaceEntries.len > displayCount then print("..." + (surfaceEntries.len - displayCount) + " more entries available in the surface cache.")
+
+  selection = normalizeInput(user_input("Select entry [1-" + displayCount + ", M=manual, blank=skip]: ")).trim
+  if selection == "" then
+    outcome.status = "skipped"
+    return outcome
+  end if
+
+  selectedPort = ""
+  selectedMemory = ""
+  selectedUnsafe = ""
+  selectedExtraArg = ""
+  selectedEntry = null
+
+  if selection.lower == "m" then
+    selectedPort = normalizeInput(user_input("Manual port [0 for router]: ")).trim
+    selectedMemory = normalizeInput(user_input("Manual memory address: ")).trim
+    selectedUnsafe = normalizeInput(user_input("Manual unsafe value: ")).trim
+  else
+    if not isNumericText(selection) then
+      outcome.status = "invalid-selection"
+      appendLine(outcome.notes, "Manual assist selection was not numeric.")
+      return outcome
+    end if
+
+    selectedIndex = selection.val - 1
+    if selectedIndex < 0 or selectedIndex >= displayCount then
+      outcome.status = "invalid-selection"
+      appendLine(outcome.notes, "Manual assist selection was outside the displayed range.")
+      return outcome
+    end if
+
+    selectedEntry = surfaceEntries[selectedIndex]
+    selectedPort = normalizeInput(selectedEntry.port).trim
+    selectedMemory = normalizeInput(selectedEntry.memory).trim
+    selectedUnsafe = normalizeInput(selectedEntry.unsafe).trim
+  end if
+
+  if not isNumericText(selectedPort) then
+    outcome.status = "invalid-port"
+    appendLine(outcome.notes, "Manual assist requires a numeric port.")
+    return outcome
+  end if
+  if selectedMemory == "" or selectedUnsafe == "" then
+    outcome.status = "invalid-selection"
+    appendLine(outcome.notes, "Manual assist requires both memory address and unsafe value.")
+    return outcome
+  end if
+
+  selectedExtraArg = normalizeInput(user_input("Extra arg [blank=auto/default]: ")).trim
+  portNumber = selectedPort.val
+  attackAddress = resolveAttackAddress(targetRecord, portNumber)
+  if attackAddress == "" then
+    outcome.status = "missing-address"
+    appendLine(outcome.notes, "Manual assist could not resolve an attack address for port " + selectedPort + ".")
+    return outcome
+  end if
+
+  if portNumber == 0 then
+    session = runtimeContext.meta.net_use(attackAddress)
+  else
+    session = runtimeContext.meta.net_use(attackAddress, portNumber)
+  end if
+
+  if session == null then
+    outcome.status = "session-failed"
+    appendLine(outcome.notes, "Manual assist could not open a new session on " + attackAddress + ":" + selectedPort)
+    return outcome
+  end if
+
+  outcome.sessions_opened = 1
+  remoteLib = session.dump_lib
+  if remoteLib == null then
+    outcome.status = "lib-failed"
+    appendLine(outcome.notes, "Manual assist failed to dump the target library.")
+    return outcome
+  end if
+
+  if selectedEntry != null and normalizeInput(selectedEntry.lib).trim != "" and normalizeInput(remoteLib.lib_name).trim != normalizeInput(selectedEntry.lib).trim then
+    appendLine(outcome.notes, "Manual assist library mismatch: expected " + normalizeInput(selectedEntry.lib).trim + " but loaded " + normalizeInput(remoteLib.lib_name).trim + ".")
+  end if
+
+  addSurfaceRecord(runState, targetRecord, selectedPort, remoteLib.lib_name, remoteLib.version, selectedMemory, selectedUnsafe, "", "manual-assist")
+  outcome.overflow_attempts = 1
+  result = runManualOverflow(remoteLib, portNumber, normalizeInput(targetRecord.lan_ip).trim, selectedMemory, selectedUnsafe, selectedExtraArg)
+  if result == null then
+    outcome.status = "manual-nohit"
+    outcome.selected_port = selectedPort
+    outcome.selected_memory = selectedMemory
+    outcome.selected_unsafe = selectedUnsafe
+    appendLine(outcome.notes, "Manual assist returned no result for " + selectedMemory + " / " + selectedUnsafe + ".")
+    return outcome
+  end if
+
+  resultType = typeof(result)
+  addSignatureCacheRecord(runState.signature_cache, remoteLib.lib_name, remoteLib.version, portNumber, selectedMemory, selectedUnsafe, resultType)
+  outcome.result = result
+  outcome.raw_result_type = resultType
+  outcome.result_type = resultType
+  outcome.status = classifyAttackStatus(resultType, result)
+  outcome.selected_port = selectedPort
+  outcome.selected_memory = selectedMemory
+  outcome.selected_unsafe = selectedUnsafe
+  appendLine(outcome.notes, "Manual assist attempted " + selectedMemory + " / " + selectedUnsafe + " -> " + resultType)
+  if resultType == "string" then appendLine(outcome.notes, "Manual assist result: " + normalizeInput(result))
+  if resultType == "number" then appendLine(outcome.notes, "Manual assist result: " + result)
+
+  if resultType == "shell" then
+    recordAcceptedTerminalAccess(result, targetRecord, runState)
+    outcome.keep_result = 1
+    return outcome
+  end if
+
+  if resultType == "computer" then
+    escalationOutcome = attemptComputerShellEscalation(runtimeContext.shell, result, targetRecord, runState)
+    outcome.escalation_status = escalationOutcome.status
+    for noteLine in escalationOutcome.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+
+    if escalationOutcome.shell != null then
+      outcome.result = escalationOutcome.shell
+      outcome.result_type = escalationOutcome.access_type
+      outcome.status = escalationOutcome.status
+      outcome.keep_result = 1
+      return outcome
+    end if
+
+    outcome.keep_result = 1
+    return outcome
+  end if
+
+  if resultType == "file" then
+    fileOutcome = handleFileAttackResult(runtimeContext, runState, targetRecord, result, selectedExtraArg)
+    outcome.status = fileOutcome.status
+    for noteLine in fileOutcome.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+    outcome.keep_result = 1
+    return outcome
+  end if
+
+  return outcome
+end function
+
+collectLocalHacks = function(runtimeContext, runState, seedHostRecord = null)
+  outcome = {
+    "status": "not-run",
+    "libraries": 0,
+    "memory_zones": 0,
+    "records_added": 0,
+    "reachable_hosts": 0,
+    "loot_hosts": 0,
+    "mail_hosts": 0,
+    "data_hosts": 0,
+    "preferred_next_hop": "",
+    "preferred_next_role": "",
+    "preferred_next_score": "",
+    "notes": [],
+  }
+
+  if runtimeContext == null or runState == null then
+    outcome.status = "missing-state"
+    return outcome
+  end if
+
+  if runtimeContext.meta == null then
+    outcome.status = "missing-metaxploit"
+    return outcome
+  end if
+
+  targetRecord = seedHostRecord
+  if targetRecord == null then
+    targetRecord = {
+      "ip": normalizeInput(runtimeContext.computer.local_ip).trim,
+      "public_ip": normalizeInput(runtimeContext.computer.public_ip).trim,
+      "lan_ip": normalizeInput(runtimeContext.computer.local_ip).trim,
+      "gateway_ip": "",
+      "role": "host",
+      "priority": "medium",
+      "score": 0,
+      "open_ports": [],
+      "source": "local-runtime",
+    }
+  end if
+
+  if targetRecord != null then
+    targetPublicIp = normalizeInput(targetRecord.public_ip).trim
+    targetLocalIp = normalizeInput(targetRecord.lan_ip).trim
+    runtimePublicIp = normalizeInput(runtimeContext.computer.public_ip).trim
+    runtimeLocalIp = normalizeInput(runtimeContext.computer.local_ip).trim
+    if targetPublicIp != "" and runtimePublicIp != "" and targetPublicIp != runtimePublicIp then
+      outcome.status = "skipped-remote-host"
+      appendLine(outcome.notes, "Local hack scan skipped because runtime host differs from target foothold.")
+      return outcome
+    end if
+    if targetLocalIp != "" and runtimeLocalIp != "" and targetLocalIp != runtimeLocalIp then
+      outcome.status = "skipped-remote-host"
+      appendLine(outcome.notes, "Local hack scan skipped because runtime host differs from target foothold.")
+      return outcome
+    end if
+  end if
+
+  lootOutcome = null
+  if runState.config.loot_mode then
+    lootOutcome = collectStructuredLoot(runtimeContext, runtimeContext.computer, runState.target, runState)
+    if lootOutcome != null then runState.loot_result = lootOutcome
+  end if
+
+  for localLibName in ["net.so", "init.so", "kernel_module.so", "kernel_router.so"]
+    yield
+    localLib = runtimeContext.meta.load("/lib/" + localLibName)
+    if localLib == null then continue
+
+    memories = runtimeContext.meta.scan(localLib)
+    if memories == null or typeof(memories) != "list" or memories.len == 0 then continue
+
+    outcome.libraries = outcome.libraries + 1
+    outcome.memory_zones = outcome.memory_zones + memories.len
+    for memoryAddress in memories
+      yield
+      scanInfo = runtimeContext.meta.scan_address(localLib, memoryAddress)
+      outcome.records_added = outcome.records_added + dumpExploitSurface(targetRecord, runtimeContext, runState, "local", localLib, memoryAddress, scanInfo, "local-lib")
+    end for
+  end for
+
+  currentHostIp = normalizeInput(runtimeContext.computer.local_ip).trim
+  bestNextHost = null
+  bestNextScore = -999999
+
+  if runState.ranked_hosts != null then
+    for hostRecord in runState.ranked_hosts
+      yield
+      if hostRecord == null then continue
+
+      intelRecord = {
+        "host_ip": normalizeInput(hostRecord.ip).trim,
+        "host_public": normalizeInput(hostRecord.public_ip).trim,
+        "host_local": normalizeInput(hostRecord.lan_ip).trim,
+        "role": normalizeInput(hostRecord.role).trim,
+        "reachable_from_chain": 1,
+        "loot_records": countLootRecordsForHost(runState, hostRecord),
+        "mail_records": countLootRecordsForHost(runState, hostRecord, "mail"),
+        "bank_records": countLootRecordsForHost(runState, hostRecord, "bank"),
+        "passwd_records": countLootRecordsForHost(runState, hostRecord, "passwd"),
+        "local_surface_records": 0,
+        "next_hop_score": buildLocalIntelScore(hostRecord, runState),
+      }
+
+      if normalizeInput(hostRecord.ip).trim == currentHostIp or normalizeInput(hostRecord.lan_ip).trim == currentHostIp then
+        intelRecord.local_surface_records = outcome.records_added
+      end if
+
+      storeHostIntelRecord(runState, hostRecord, intelRecord)
+      applyLocalIntelToHostRecord(hostRecord, intelRecord)
+      outcome.reachable_hosts = outcome.reachable_hosts + 1
+
+      if intelRecord.loot_records > 0 then outcome.loot_hosts = outcome.loot_hosts + 1
+      roleText = normalizeInput(hostRecord.role).trim.lower
+      if roleText == "mail-server" or intelRecord.mail_records > 0 then outcome.mail_hosts = outcome.mail_hosts + 1
+      if roleText == "data-server" or intelRecord.bank_records > 0 or intelRecord.passwd_records > 0 then outcome.data_hosts = outcome.data_hosts + 1
+
+      if intelRecord.host_ip == currentHostIp or intelRecord.host_local == currentHostIp then continue
+      if hostRecord.open_ports == null or hostRecord.open_ports.len == 0 then
+        if intelRecord.loot_records == 0 then continue
+      end if
+
+      if bestNextHost == null or intelRecord.next_hop_score > bestNextScore then
+        bestNextHost = hostRecord
+        bestNextScore = intelRecord.next_hop_score
+      else if intelRecord.next_hop_score == bestNextScore and normalizeInput(hostRecord.ip).trim < normalizeInput(bestNextHost.ip).trim then
+        bestNextHost = hostRecord
+        bestNextScore = intelRecord.next_hop_score
+      end if
+    end for
+  end if
+
+  if bestNextHost != null then
+    outcome.preferred_next_hop = normalizeInput(bestNextHost.ip).trim
+    outcome.preferred_next_role = normalizeInput(bestNextHost.role).trim
+    outcome.preferred_next_score = "" + bestNextScore
+    runState.preferred_next_host = outcome.preferred_next_hop
+  else
+    runState.preferred_next_host = ""
+  end if
+
+  if outcome.libraries == 0 and outcome.reachable_hosts == 0 then
+    outcome.status = "no-local-libs"
+  else if outcome.libraries == 0 then
+    outcome.status = "intel-only"
+  else
+    outcome.status = "complete"
+  end if
+  appendLine(outcome.notes, "Local hack scan libraries: " + outcome.libraries)
+  appendLine(outcome.notes, "Local hack scan records: " + outcome.records_added)
+  appendLine(outcome.notes, "Chain hosts reachable: " + outcome.reachable_hosts)
+  appendLine(outcome.notes, "Hosts with loot hints: " + outcome.loot_hosts)
+  appendLine(outcome.notes, "Mail hosts: " + outcome.mail_hosts)
+  appendLine(outcome.notes, "Data hosts: " + outcome.data_hosts)
+  if lootOutcome != null then appendLine(outcome.notes, "Current host loot records: " + lootOutcome.records.len)
+  if outcome.preferred_next_hop != "" then
+    appendLine(outcome.notes, "Preferred next hop: " + outcome.preferred_next_hop + " (" + outcome.preferred_next_role + ", score=" + outcome.preferred_next_score + ")")
+  else
+    appendLine(outcome.notes, "Preferred next hop: -")
+  end if
+  runState.local_recon = outcome
+  return outcome
+end function
+
+buildWorkerArgs = function(runConfig, targetContext, remoteDir, nextPivotDepth, workerTargetIp = "")
+  argParts = []
+
+  argParts.push("--mode")
+  argParts.push("worker")
+  argParts.push("--non-interactive")
+  argParts.push("1")
+  argParts.push("--open-terminal")
+  argParts.push("" + runConfig.open_terminal)
+  argParts.push("--stop-on-success")
+  argParts.push("" + runConfig.stop_on_success)
+  argParts.push("--pivot-depth")
+  argParts.push("" + nextPivotDepth)
+  argParts.push("--max-pivot-depth")
+  argParts.push("" + runConfig.max_pivot_depth)
+
+  effectiveTargetIp = norm(workerTargetIp)
+  if effectiveTargetIp == "" then effectiveTargetIp = norm(targetContext.target_ip)
+
+  if effectiveTargetIp != "" then
+    argParts.push("--target-ip")
+    argParts.push(effectiveTargetIp)
+  end if
+
+  if norm(targetContext.target_lan_ip) != "" then
+    argParts.push("--target-lan-ip")
+    argParts.push(norm(targetContext.target_lan_ip))
+  end if
+
+  if norm(targetContext.target_user) != "" then
+    argParts.push("--target-user")
+    argParts.push(norm(targetContext.target_user))
+  end if
+
+  if norm(runConfig.known_user) != "" then
+    argParts.push("--known-user")
+    argParts.push(norm(runConfig.known_user))
+  end if
+
+  if norm(runConfig.known_pass) != "" then
+    argParts.push("--known-pass")
+    argParts.push(norm(runConfig.known_pass))
+  end if
+
+  if runConfig.fast_shell_only then
+    argParts.push("--fast-shell-only")
+    argParts.push("1")
+  end if
+
+  if runConfig.skip_loot then
+    argParts.push("--skip-loot")
+    argParts.push("1")
+  end if
+
+  if runConfig.skip_credential_reuse then
+    argParts.push("--skip-credential-reuse")
+    argParts.push("1")
+  end if
+
+  if norm(runConfig.cleanup_mode) != "" then
+    argParts.push("--cleanup")
+    argParts.push(norm(runConfig.cleanup_mode))
+  end if
+
+  if remoteDir != "" then
+    argParts.push("--shared-dir")
+    argParts.push(remoteDir)
+    argParts.push("--lib-dir")
+    argParts.push(remoteDir)
+  end if
+
+  return argParts.join(" ")
+end function
+
+mergeWorkerOutputs = function(runState, remoteComputer, remoteDir)
+  outcome = {
+    "status": "not-run",
+    "worker_status": "",
+    "worker_accepted_host": "",
+    "worker_accepted_access_level": "",
+    "merged_signatures": 0,
+    "merged_credentials": 0,
+    "merged_surface": 0,
+    "merged_loot": 0,
+    "merged_visited": 0,
+    "notes": [],
+  }
+
+  if runState == null then
+    outcome.status = "missing-state"
+    return outcome
+  end if
+
+  if remoteComputer == null then
+    outcome.status = "missing-computer"
+    return outcome
+  end if
+
+  remoteOutputDir = ""
+  candidateDirs = []
+  preferredOutputDir = buildManagedOutputDirPath(remoteDir)
+  fallbackOutputDir = norm(remoteDir)
+  if preferredOutputDir != "" then candidateDirs.push(preferredOutputDir)
+  if fallbackOutputDir != "" and fallbackOutputDir != preferredOutputDir then candidateDirs.push(fallbackOutputDir)
+  if candidateDirs.len == 0 then
+    outcome.status = "missing-output-dir"
+    return outcome
+  end if
+
+  workerManifest = null
+  importedSignatureCache = null
+  importedCredentialCache = null
+  importedSurfaceCache = null
+  importedLootCache = null
+  bestCandidateScore = -1
+
+  for candidateOutputDir in candidateDirs
+    candidateManifest = loadWorkerManifest(remoteComputer.File(candidateOutputDir + "/" + WORKER_MANIFEST_FILE))
+    candidateSignatureCache = loadSignatureCache(remoteComputer.File(candidateOutputDir + "/crs_v1_signature_cache.tsv"))
+    candidateCredentialCache = loadCredentialCache(remoteComputer.File(candidateOutputDir + "/crs_v1_credential_cache.tsv"))
+    candidateSurfaceCache = loadSurfaceCache(remoteComputer.File(candidateOutputDir + "/crs_v1_surface_cache.tsv"))
+    candidateLootCache = loadLootCache(remoteComputer.File(candidateOutputDir + "/crs_v1_loot_cache.tsv"))
+    candidateScore = 0
+    if norm(candidateManifest.status) != "" or normLower(candidateManifest.mode) == "worker" then candidateScore = candidateScore + 1000
+    if candidateManifest.visited_hosts != null then candidateScore = candidateScore + candidateManifest.visited_hosts.len
+    if candidateSignatureCache != null and candidateSignatureCache.records != null then candidateScore = candidateScore + candidateSignatureCache.records.len
+    if candidateCredentialCache != null and candidateCredentialCache.records != null then candidateScore = candidateScore + candidateCredentialCache.records.len
+    if candidateSurfaceCache != null and candidateSurfaceCache.records != null then candidateScore = candidateScore + candidateSurfaceCache.records.len
+    if candidateLootCache != null and candidateLootCache.records != null then candidateScore = candidateScore + candidateLootCache.records.len
+    if candidateScore <= bestCandidateScore then continue
+    bestCandidateScore = candidateScore
+    remoteOutputDir = candidateOutputDir
+    workerManifest = candidateManifest
+    importedSignatureCache = candidateSignatureCache
+    importedCredentialCache = candidateCredentialCache
+    importedSurfaceCache = candidateSurfaceCache
+    importedLootCache = candidateLootCache
+  end for
+
+  if workerManifest == null then workerManifest = loadWorkerManifest(null)
+  outcome.worker_status = normalizeInput(workerManifest.status).trim
+  outcome.worker_accepted_host = normalizeInput(workerManifest.accepted_host).trim
+  outcome.worker_accepted_access_level = normalizeInput(workerManifest.accepted_access_level).trim
+
+  if workerManifest.visited_hosts != null then
+    for visitedHost in workerManifest.visited_hosts
+      if markVisitedHost(runState, visitedHost) then outcome.merged_visited = outcome.merged_visited + 1
+    end for
+  end if
+
+  if importedSignatureCache != null and importedSignatureCache.records != null then
+    for signatureRecord in importedSignatureCache.records
+      if signatureRecord == null then continue
+      if addSignatureCacheRecord(runState.signature_cache, signatureRecord.lib, signatureRecord.version, signatureRecord.port, signatureRecord.memory, signatureRecord.unsafe, signatureRecord.type) then
+        outcome.merged_signatures = outcome.merged_signatures + 1
+      end if
+    end for
+  end if
+
+  if importedCredentialCache != null and importedCredentialCache.records != null then
+    for credentialRecord in importedCredentialCache.records
+      if credentialRecord == null then continue
+      if addCredentialCacheRecord(runState.credential_cache, credentialRecord.host_public, credentialRecord.host_local, credentialRecord.user, credentialRecord.password, credentialRecord.source) then
+        outcome.merged_credentials = outcome.merged_credentials + 1
+      end if
+    end for
+  end if
+
+  if importedSurfaceCache != null and importedSurfaceCache.records != null then
+    for surfaceRecord in importedSurfaceCache.records
+      if surfaceRecord == null then continue
+      if addSurfaceRecordByFields(runState, surfaceRecord.host_ip, surfaceRecord.host_public, surfaceRecord.host_local, surfaceRecord.port, surfaceRecord.lib, surfaceRecord.version, surfaceRecord.memory, surfaceRecord.unsafe, surfaceRecord.scan_info, surfaceRecord.origin) then
+        outcome.merged_surface = outcome.merged_surface + 1
+      end if
+    end for
+  end if
+
+  if importedLootCache != null and importedLootCache.records != null then
+    for lootRecord in importedLootCache.records
+      if lootRecord == null then continue
+      if addLootRecord(runState, lootRecord.host_public, lootRecord.host_local, lootRecord.user, lootRecord.artifact_type, lootRecord.account, lootRecord.secret, lootRecord.source, lootRecord.notes) then
+        outcome.merged_loot = outcome.merged_loot + 1
+      end if
+    end for
+  end if
+
+  mergedTotal = outcome.merged_signatures + outcome.merged_credentials + outcome.merged_surface + outcome.merged_loot + outcome.merged_visited
+  if mergedTotal > 0 then
+    outcome.status = "complete"
+  else if outcome.worker_status != "" or normalizeInput(workerManifest.mode).trim == "worker" then
+    outcome.status = "manifest-only"
+  else
+    outcome.status = "no-worker-data"
+  end if
+
+  if outcome.worker_status != "" then
+    appendLine(outcome.notes, "Worker status: " + outcome.worker_status + " (" + formatValueDisplay(outcome.worker_accepted_access_level) + " @ " + formatValueDisplay(outcome.worker_accepted_host) + ")")
+  end if
+  if remoteOutputDir != "" then appendLine(outcome.notes, "Worker output dir: " + remoteOutputDir)
+  appendLine(outcome.notes, "Worker merge: signatures=" + outcome.merged_signatures + ", credentials=" + outcome.merged_credentials + ", surface=" + outcome.merged_surface + ", loot=" + outcome.merged_loot + ", visited=" + outcome.merged_visited)
+  runState.worker_merge_result = outcome
+  return outcome
+end function
+
+launchRemoteExplorer = function(accessObject)
+  if accessObject == null then return "missing-access"
+  if loginAccessType(accessObject) != "shell" then return "not-shell"
+
+  remoteComputer = getAccessHostComputer(accessObject)
+  if remoteComputer == null then return "missing-computer"
+
+  lastError = ""
+  for candidatePath in ["FileExplorer.exe", "/root/FileExplorer.exe", "/usr/FileExplorer.exe", "/bin/FileExplorer.exe", "/usr/bin/FileExplorer.exe"]
+    if candidatePath.indexOf("/") != null then
+      candidateFile = remoteComputer.File(candidatePath)
+      if candidateFile == null then continue
+      if candidateFile.is_folder then continue
+    end if
+
+    launchResult = accessObject.launch(candidatePath, "")
+    if launchResult == null or launchResult == 1 then return "launched"
+    if lastError == "" and isError(launchResult) then lastError = normalizeInput(launchResult).trim
+  end for
+
+  if lastError != "" then return lastError
+  return "missing-explorer"
+end function
+
+shouldAttemptRouterHandoff = function(runState, acceptedRecord, acceptedAccess)
+  if acceptedRecord == null then return 0
+  if acceptedAccess == null then return 0
+  if loginAccessType(acceptedAccess) != "shell" then return 0
+  if runState == null then return 0
+  if runState.config.mode == "worker" then return 0
+  if runState.pivot_depth >= runState.config.max_pivot_depth then return 0
+
+  roleText = normalizeInput(acceptedRecord.role).trim.lower
+  if roleText.indexOf("gateway") == null then return 0
+
+  targetLanIp = normalizeInput(runState.target.target_lan_ip).trim
+  acceptedLanIp = normalizeInput(acceptedRecord.lan_ip).trim
+  if targetLanIp != "" and acceptedLanIp == targetLanIp then return 0
+
+  for hostRecord in runState.ranked_hosts
+    if hostRecord == null then continue
+    if normalizeInput(hostRecord.ip).trim == normalizeInput(acceptedRecord.ip).trim then continue
+    return 1
+  end for
+
+  return 0
+end function
+
+attemptRouterHandoff = function(runState, acceptedRecord, acceptedAccess)
+  outcome = {
+    "status": "not-run",
+    "remote_dir": "",
+    "remote_program": "",
+    "launch_args": "",
+    "notes": [],
+  }
+
+  if runState == null then
+    outcome.status = "missing-state"
+    return outcome
+  end if
+
+  if not shouldAttemptRouterHandoff(runState, acceptedRecord, acceptedAccess) then
+    outcome.status = "not-needed"
+    return outcome
+  end if
+
+  remoteComputer = getAccessHostComputer(acceptedAccess)
+  if remoteComputer == null then
+    outcome.status = "missing-remote-computer"
+    return outcome
+  end if
+
+  hostKey = buildHostKey(remoteComputer.public_ip, remoteComputer.local_ip)
+  if runState.launched_workers.hasIndex(hostKey) then
+    outcome.status = "already-launched"
+    return outcome
+  end if
+
+  remoteDir = findWritableDeployFolder(remoteComputer)
+  if remoteDir == "" then
+    outcome.status = "no-remote-dir"
+    appendLine(outcome.notes, "No writable remote folder for router handoff.")
+    return outcome
+  end if
+
+  stageOutcome = stageRemoteToolkit(runState, acceptedAccess, acceptedRecord, remoteDir)
+  runState.stage_result = stageOutcome
+  for noteLine in stageOutcome.notes
+    appendLine(outcome.notes, noteLine)
+  end for
+  if stageOutcome.status != "staged" and stageOutcome.status != "already-staged" then
+    outcome.status = stageOutcome.status
+    return outcome
+  end if
+
+  remoteProgram = stageOutcome.remote_program
+  if remoteProgram == "" then remoteProgram = remoteDir + "/" + pathBaseName(runState.runtime.program_path)
+  workerTargetIp = normalizeInput(acceptedRecord.lan_ip).trim
+  if workerTargetIp == "" then workerTargetIp = normalizeInput(remoteComputer.local_ip).trim
+  launchArgs = buildWorkerArgs(runState.config, runState.target, remoteDir, runState.pivot_depth + 1, workerTargetIp)
+  launchResult = acceptedAccess.launch(remoteProgram, launchArgs)
+  if launchResult != null and launchResult != 1 then
+    outcome.status = "launch-failed"
+    appendLine(outcome.notes, "Worker launch failed: " + normalizeInput(launchResult))
+    return outcome
+  end if
+
+  mergeOutcome = mergeWorkerOutputs(runState, remoteComputer, remoteDir)
+  runState.worker_merge_result = mergeOutcome
+  for noteLine in mergeOutcome.notes
+    appendLine(outcome.notes, noteLine)
+  end for
+
+  runState.launched_workers[hostKey] = 1
+  outcome.status = "launched"
+  outcome.remote_dir = remoteDir
+  outcome.remote_program = remoteProgram
+  outcome.launch_args = launchArgs
+  appendLine(outcome.notes, "Router handoff launched from " + normalizeInput(acceptedRecord.ip).trim)
+  return outcome
+end function
+
+executeMissionAction = function(runState, accessObject, targetRecord = null)
+  outcome = {
+    "status": "not-run",
+    "mode": "",
+    "records": 0,
+    "scanned_files": 0,
+    "notes": [],
+  }
+
+  if runState == null then
+    outcome.status = "missing-state"
+    return outcome
+  end if
+
+  missionMode = normalizeMissionActionMode(runState.config.mission_action, "loot")
+  outcome.mode = missionMode
+  if missionMode == "off" then
+    outcome.status = "disabled"
+    return outcome
+  end if
+
+  if not runState.config.loot_mode then
+    outcome.status = "loot-disabled"
+    appendLine(outcome.notes, "Mission action requires loot mode to be enabled.")
+    runState.mission_action_result = outcome
+    return outcome
+  end if
+
+  if accessObject == null then
+    outcome.status = "missing-access"
+    return outcome
+  end if
+
+  remoteComputer = getAccessHostComputer(accessObject)
+  if remoteComputer == null then
+    outcome.status = "missing-computer"
+    return outcome
+  end if
+
+  lootOutcome = collectStructuredLoot(runState.runtime, remoteComputer, runState.target, runState)
+  runState.loot_result = lootOutcome
+  if lootOutcome != null then
+    outcome.scanned_files = lootOutcome.scanned_files
+    for noteLine in lootOutcome.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+  end if
+
+  matchedLoot = collectMissionLootRecords(runState, remoteComputer, missionMode)
+  outcome.records = matchedLoot.len
+
+  if targetRecord != null then
+    appendLine(outcome.notes, "Mission action target: " + normalizeInput(targetRecord.ip).trim)
+  else
+    appendLine(outcome.notes, "Mission action target: " + normalizeInput(remoteComputer.local_ip).trim)
+  end if
+
+  if matchedLoot.len == 0 then
+    outcome.status = "no-records"
+    appendLine(outcome.notes, "Mission action mode " + missionMode + " found no matching structured records.")
+    runState.mission_action_result = outcome
+    return outcome
+  end if
+
+  typeCounts = {}
+  for lootRecord in matchedLoot
+    if lootRecord == null then continue
+    artifactType = normalizeInput(lootRecord.artifact_type).trim.lower
+    if artifactType == "" then artifactType = "unknown"
+    if not typeCounts.hasIndex(artifactType) then typeCounts[artifactType] = 0
+    typeCounts[artifactType] = typeCounts[artifactType] + 1
+  end for
+
+  summaryParts = []
+  for artifactType in ["passwd", "mail", "bank", "unknown"]
+    if not typeCounts.hasIndex(artifactType) then continue
+    summaryParts.push(artifactType + "=" + typeCounts[artifactType])
+  end for
+
+  outcome.status = "records=" + matchedLoot.len
+  appendLine(outcome.notes, "Mission action mode " + missionMode + " matched " + matchedLoot.len + " records.")
+  if summaryParts.len > 0 then appendLine(outcome.notes, "Mission action breakdown: " + summaryParts.join(", "))
+  runState.mission_action_result = outcome
+  return outcome
+end function
+
+findNamedFileInFolder = function(folderObject, wantedName)
+  if folderObject == null then return null
+  if not folderObject.is_folder then return null
+  if not folderObject.has_permission("r") then return null
+
+  for fileObject in folderObject.get_files
+    if fileObject == null then continue
+    if normalizeInput(fileObject.name).trim.lower == normalizeInput(wantedName).trim.lower then return fileObject
+  end for
+
+  return null
+end function
+
+findPasswdFileFromAttackFile = function(fileObject)
+  if fileObject == null then return null
+  if typeof(fileObject) != "file" then return null
+
+  if not fileObject.is_folder then
+    if normalizeInput(fileObject.name).trim.lower == "passwd" and not fileObject.is_binary and fileObject.has_permission("r") then return fileObject
+    return null
+  end if
+
+  if normalizeInput(fileObject.path).trim == "/etc" then
+    return findNamedFileInFolder(fileObject, "passwd")
+  end if
+
+  currentFolder = fileObject
+  guard = 0
+  while currentFolder != null and normalizeInput(currentFolder.path).trim != "/" and guard < 32
+    currentFolder = currentFolder.parent
+    guard = guard + 1
+  end while
+
+  if currentFolder == null then return null
+  if not currentFolder.is_folder then return null
+  if not currentFolder.has_permission("r") then return null
+
+  for folderEntry in currentFolder.get_folders
+    if folderEntry == null then continue
+    if normalizeInput(folderEntry.path).trim != "/etc" then continue
+    return findNamedFileInFolder(folderEntry, "passwd")
+  end for
+
+  return null
+end function
+
+buildFileResultHostHints = function(runState, targetRecord, extraArg = "")
+  hostPublicIp = ""
+  hostLocalIp = ""
+
+  if targetRecord != null then
+    hostPublicIp = normalizeInput(targetRecord.public_ip).trim
+    hostLocalIp = normalizeInput(targetRecord.lan_ip).trim
+    if hostPublicIp == "" and not is_lan_ip(normalizeInput(targetRecord.ip).trim) then hostPublicIp = normalizeInput(targetRecord.ip).trim
+    if hostLocalIp == "" and is_lan_ip(normalizeInput(targetRecord.ip).trim) then hostLocalIp = normalizeInput(targetRecord.ip).trim
+  end if
+
+  if normalizeInput(extraArg).trim != "" then hostLocalIp = normalizeInput(extraArg).trim
+  return {
+    "host_public": hostPublicIp,
+    "host_local": hostLocalIp,
+  }
+end function
+
+handleFileAttackResult = function(runtimeContext, runState, targetRecord, fileResult, extraArg = "")
+  outcome = {
+    "status": "file",
+    "loot_added": 0,
+    "credential_records": 0,
+    "notes": [],
+  }
+
+  if runtimeContext == null or runState == null then
+    outcome.status = "file-missing-state"
+    return outcome
+  end if
+  if fileResult == null or typeof(fileResult) != "file" then return outcome
+
+  hostHints = buildFileResultHostHints(runState, targetRecord, extraArg)
+  pathLower = normalizeInput(fileResult.path).trim.lower
+
+  passwdFile = findPasswdFileFromAttackFile(fileResult)
+  if passwdFile != null then
+    passwdOutcome = addPasswdLootFromFile(runtimeContext, runState, hostHints.host_public, hostHints.host_local, passwdFile, "attack-file-passwd")
+    outcome.loot_added = outcome.loot_added + passwdOutcome.added
+    outcome.credential_records = outcome.credential_records + passwdOutcome.credential_records
+    if passwdOutcome.users > 0 then
+      outcome.status = "file-passwd"
+      appendLine(outcome.notes, "File result exposed /etc/passwd with " + passwdOutcome.users + " user entries.")
+      appendLine(outcome.notes, "File result added " + passwdOutcome.credential_records + " credential cache records from passwd.")
+    end if
+  end if
+
+  if not fileResult.is_folder and fileResult.has_permission("r") and not fileResult.is_binary then
+    if pathLower.indexOf("/config/mail.txt") != null then
+      added = addStructuredLootFromHostHints(runtimeContext, runState, hostHints.host_public, hostHints.host_local, fileResult, pathBaseName(fileResult.path), "mail")
+      outcome.loot_added = outcome.loot_added + added
+      if added > 0 then
+        outcome.status = "file-mail"
+        appendLine(outcome.notes, "File result added mail loot records from " + fileResult.path)
+      end if
+    end if
+
+    if pathLower.indexOf("/config/bank.txt") != null then
+      added = addStructuredLootFromHostHints(runtimeContext, runState, hostHints.host_public, hostHints.host_local, fileResult, pathBaseName(fileResult.path), "bank")
+      outcome.loot_added = outcome.loot_added + added
+      if added > 0 then
+        outcome.status = "file-bank"
+        appendLine(outcome.notes, "File result added bank loot records from " + fileResult.path)
+      end if
+    end if
+  end if
+
+  if outcome.loot_added == 0 and outcome.credential_records == 0 and outcome.status == "file" then
+    outcome.status = "file-no-loot"
+    appendLine(outcome.notes, "File result did not expose structured loot or passwd credentials.")
+  end if
+
+  return outcome
+end function
+
+scoreFileAttackOutcome = function(fileOutcome)
+  if fileOutcome == null then return 0
+  if fileOutcome.credential_records > 0 then return 3
+  if fileOutcome.loot_added > 0 then return 2
+  return 1
+end function
+
+buildCleanupLogNeedles = function(runState)
+  needles = []
+  seen = []
+  if runState == null or runState.runtime == null then return needles
+
+  if runState.runtime.computer != null then
+    pushUniqueString(needles, seen, runState.runtime.computer.public_ip)
+    pushUniqueString(needles, seen, runState.runtime.computer.local_ip)
+  end if
+
+  if runState.runtime.current_router != null then
+    pushUniqueString(needles, seen, runState.runtime.current_router.public_ip)
+    pushUniqueString(needles, seen, runState.runtime.current_router.local_ip)
+  end if
+
+  return needles
+end function
+
+shouldSurgicalScrubLogLine = function(lineText, needles)
+  cleanLine = norm(lineText)
+  if cleanLine == "" then return 0
+
+  lowered = cleanLine.lower
+  if lowered.indexOf("shell obtained") == null and lowered.indexOf("file deleted") == null then return 0
+  if needles == null or needles.len == 0 then return 0
+
+  for needle in needles
+    cleanNeedle = normLower(needle)
+    if cleanNeedle == "" then continue
+    if lowered.indexOf(cleanNeedle) != null then return 1
+  end for
+
+  return 0
+end function
+
+surgicalScrubSystemLog = function(remoteComputer, runState)
+  outcome = {
+    "status": "not-run",
+    "removed": 0,
+    "notes": [],
+  }
+
+  if remoteComputer == null then
+    outcome.status = "missing-computer"
+    return outcome
+  end if
+
+  systemLog = remoteComputer.File("/var/system.log")
+  if systemLog == null or systemLog.is_folder then
+    outcome.status = "missing-log"
+    return outcome
+  end if
+
+  if not systemLog.has_permission("r") or not systemLog.has_permission("w") then
+    outcome.status = "log-permission-denied"
+    return outcome
+  end if
+
+  needles = buildCleanupLogNeedles(runState)
+  if needles == null or needles.len == 0 then
+    outcome.status = "no-needles"
+    return outcome
+  end if
+
+  logContent = readTextFile(systemLog)
+  if logContent == null then
+    outcome.status = "unreadable-log"
+    return outcome
+  end if
+
+  keptLines = []
+  for rawLine in logContent.split(NL)
+    if shouldSurgicalScrubLogLine(rawLine, needles) then
+      outcome.removed = outcome.removed + 1
+    else
+      keptLines.push(rawLine)
+    end if
+  end for
+
+  if outcome.removed == 0 then
+    outcome.status = "no-matches"
+    return outcome
+  end if
+
+  writeResult = systemLog.set_content(keptLines.join(NL))
+  if not isApiSuccess(writeResult) then
+    outcome.status = "write-failed"
+    appendLine(outcome.notes, "Surgical system log scrub failed: " + normalizeInput(writeResult))
+    return outcome
+  end if
+
+  outcome.status = "complete"
+  appendLine(outcome.notes, "System log surgically scrubbed (" + outcome.removed + " lines removed).")
+  return outcome
+end function
+
+cleanupAccessArtifacts = function(accessObject, runState)
+  outcome = {
+    "status": "not-run",
+    "cleaned": 0,
+    "mode": "",
+    "notes": [],
+  }
+
+  if runState == null then
+    outcome.status = "missing-state"
+    return outcome
+  end if
+
+  cleanupMode = normalizeCleanupMode(runState.config.cleanup_mode, "prompt")
+  outcome.mode = cleanupMode
+  if cleanupMode == "off" then
+    outcome.status = "disabled"
+    return outcome
+  end if
+
+  if accessObject == null then
+    outcome.status = "missing-access"
+    return outcome
+  end if
+
+  remoteComputer = getAccessHostComputer(accessObject)
+  if remoteComputer == null then
+    outcome.status = "missing-computer"
+    return outcome
+  end if
+
+  effectiveMode = cleanupMode
+  if cleanupMode == "prompt" then
+    if runState.config.non_interactive then
+      effectiveMode = "safe"
+    else
+      response = normalizeInput(user_input("Cleanup staged artifacts on " + formatValueDisplay(remoteComputer.local_ip) + " [safe/surgical/wipe/skip]: ")).trim.lower
+      if response == "wipe" or response == "w" then
+        effectiveMode = "wipe"
+      else if response == "surgical" or response == "sg" then
+        effectiveMode = "surgical"
+      else if response == "safe" or response == "s" or response == "y" or response == "yes" then
+        effectiveMode = "safe"
+      else
+        effectiveMode = "off"
+      end if
+    end if
+  end if
+  outcome.mode = effectiveMode
+
+  if effectiveMode == "off" then
+    outcome.status = "skipped"
+    return outcome
+  end if
+
+  hostKey = buildHostKey(remoteComputer.public_ip, remoteComputer.local_ip)
+  normalizedHostKey = normalizeCacheField(hostKey)
+  cleanupFiles = []
+  cleanupFileSeen = {}
+  cleanupDirs = []
+  cleanupDirSeen = {}
+
+  for stagedEntry in runState.staged_paths
+    if stagedEntry == null then continue
+    if stagedEntry.host_key != normalizedHostKey then continue
+    if stagedEntry.hasIndex("cleaned") and stagedEntry.cleaned then continue
+
+    addUniquePathValue(cleanupFiles, cleanupFileSeen, stagedEntry.path)
+    parentDir = pathParentDir(stagedEntry.path)
+    if parentDir != "" then appendManagedOutputCleanupTargets(cleanupFiles, cleanupFileSeen, cleanupDirs, cleanupDirSeen, parentDir)
+  end for
+
+  for cleanupPath in cleanupFiles
+    stagedFile = remoteComputer.File(cleanupPath)
+    if stagedFile == null then continue
+    deleteResult = stagedFile.delete
+    if not isError(deleteResult) then
+      outcome.cleaned = outcome.cleaned + 1
+      for stagedEntry in runState.staged_paths
+        if stagedEntry == null then continue
+        if stagedEntry.host_key != normalizedHostKey then continue
+        if norm(stagedEntry.path) != norm(cleanupPath) then continue
+        stagedEntry.cleaned = 1
+      end for
+    end if
+  end for
+
+  if effectiveMode == "surgical" then
+    scrubOutcome = surgicalScrubSystemLog(remoteComputer, runState)
+    if scrubOutcome.status == "complete" then outcome.cleaned = outcome.cleaned + 1
+    for noteLine in scrubOutcome.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+  else if effectiveMode == "wipe" then
+    if runState.cleanup_users != null then
+      for cleanupUser in runState.cleanup_users
+        if cleanupUser == null then continue
+        if cleanupUser.host_key != normalizedHostKey then continue
+        if cleanupUser.deleted then continue
+        if norm(cleanupUser.user) == "" then continue
+
+        deleteUserResult = remoteComputer.delete_user(cleanupUser.user, cleanupUser.delete_home)
+        if isApiSuccess(deleteUserResult) then
+          cleanupUser.deleted = 1
+          outcome.cleaned = outcome.cleaned + 1
+          appendLine(outcome.notes, "Persistence user deleted: " + cleanupUser.user)
+        end if
+      end for
+    end if
+
+    systemLog = remoteComputer.File("/var/system.log")
+    if systemLog != null and not systemLog.is_folder and systemLog.has_permission("w") then
+      clearResult = systemLog.set_content("")
+      if isApiSuccess(clearResult) then
+        outcome.cleaned = outcome.cleaned + 1
+        appendLine(outcome.notes, "System log truncated.")
+      end if
+    end if
+  end if
+
+  for cleanupDir in cleanupDirs
+    cleanupFolder = remoteComputer.File(cleanupDir)
+    if cleanupFolder == null then continue
+    if not cleanupFolder.is_folder then continue
+    deleteDirResult = cleanupFolder.delete
+    if isApiSuccess(deleteDirResult) then
+      outcome.cleaned = outcome.cleaned + 1
+      appendLine(outcome.notes, "Managed output folder removed: " + cleanupDir)
+    end if
+  end for
+
+  if outcome.cleaned == 0 then
+    outcome.status = "nothing-cleaned"
+  else
+    outcome.status = "complete"
+  end if
+  runState.cleanup_result = outcome
+  return outcome
+end function
+
+finalizeAcceptedAccess = function(runState)
+  outcome = {
+    "status": "no-access",
+    "accepted_type": "",
+    "accepted_access_level": "",
+    "accepted_host": "",
+    "explorer_status": "",
+    "handoff_status": "",
+    "stage_status": "",
+    "local_recon_status": "",
+    "local_recon_next_hop": "",
+    "mission_action_status": "",
+    "loot_status": "",
+    "cleanup_status": "",
+    "notes": [],
+  }
+
+  acceptedAccess = runState.accepted_shell
+  acceptedLevel = normalizeInput(runState.accepted_access_level).trim
+  if acceptedAccess == null then
+    if runState.provisional_shell == null then return outcome
+    acceptedAccess = runState.provisional_shell
+    acceptedLevel = normalizeInput(runState.provisional_access_level).trim
+  end if
+
+  acceptedType = loginAccessType(acceptedAccess)
+  acceptedComputer = getAccessHostComputer(acceptedAccess)
+  acceptedRecord = findHostRecordForComputer(runState.ranked_hosts, acceptedComputer)
+  if acceptedRecord == null then acceptedRecord = runState.selected_host_record
+
+  outcome.accepted_type = acceptedType
+  outcome.accepted_access_level = acceptedLevel
+  if acceptedRecord != null then outcome.accepted_host = normalizeInput(acceptedRecord.ip).trim
+
+  if shouldAttemptRouterHandoff(runState, acceptedRecord, acceptedAccess) then
+    handoffOutcome = attemptRouterHandoff(runState, acceptedRecord, acceptedAccess)
+    runState.handoff_result = handoffOutcome
+    outcome.handoff_status = handoffOutcome.status
+    if runState.stage_result != null then outcome.stage_status = runState.stage_result.status
+    for noteLine in handoffOutcome.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+
+    if handoffOutcome.status == "launched" then
+      outcome.status = "router-handoff"
+      outcome.mission_action_status = "deferred-router-handoff"
+      if runState.worker_merge_result != null then
+        if runState.worker_merge_result.merged_loot > 0 then
+          outcome.loot_status = "merged=" + runState.worker_merge_result.merged_loot
+        else
+          outcome.loot_status = runState.worker_merge_result.status
+        end if
+      end if
+      cleanupOutcome = cleanupAccessArtifacts(acceptedAccess, runState)
+      outcome.cleanup_status = cleanupOutcome.status
+      for noteLine in cleanupOutcome.notes
+        appendLine(outcome.notes, noteLine)
+      end for
+      runState.final_result = outcome
+      return outcome
+    end if
+  end if
+
+  stageOutcome = stageRemoteToolkit(runState, acceptedAccess, acceptedRecord)
+  if stageOutcome != null then
+    runState.stage_result = stageOutcome
+    outcome.stage_status = stageOutcome.status
+    for noteLine in stageOutcome.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+  end if
+
+  lpeOutcome = attemptLocalLpeWorker(runState, acceptedAccess, acceptedRecord)
+  if lpeOutcome != null then
+    runState.lpe_result = lpeOutcome
+    for noteLine in lpeOutcome.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+
+    if lpeOutcome.shell != null then
+      newAccessLevel = norm(lpeOutcome.access_level)
+      if accessLevelScore(newAccessLevel) >= accessLevelScore(acceptedLevel) then
+        acceptedAccess = lpeOutcome.shell
+        acceptedType = loginAccessType(acceptedAccess)
+        acceptedLevel = newAccessLevel
+        acceptedComputer = getAccessHostComputer(acceptedAccess)
+        if acceptedComputer != null then runState.accepted_host_key = buildHostKey(acceptedComputer.public_ip, acceptedComputer.local_ip)
+        runState.accepted_shell = acceptedAccess
+        runState.accepted_access_level = acceptedLevel
+        if acceptedRecord == null then acceptedRecord = findHostRecordForComputer(runState.ranked_hosts, acceptedComputer)
+
+        outcome.accepted_type = acceptedType
+        outcome.accepted_access_level = acceptedLevel
+        if acceptedRecord != null then
+          outcome.accepted_host = norm(acceptedRecord.ip)
+        else if acceptedComputer != null then
+          outcome.accepted_host = norm(acceptedComputer.local_ip)
+          if outcome.accepted_host == "" then outcome.accepted_host = norm(acceptedComputer.public_ip)
+        end if
+      end if
+    end if
+  end if
+
+  localReconOutcome = collectLocalHacks(runState.runtime, runState, acceptedRecord)
+  if localReconOutcome != null then
+    outcome.local_recon_status = localReconOutcome.status
+    outcome.local_recon_next_hop = localReconOutcome.preferred_next_hop
+    for noteLine in localReconOutcome.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+  end if
+
+  if runState.loot_records != null and runState.loot_records.len > 0 then
+    outcome.loot_status = "records=" + runState.loot_records.len
+  else if runState.config.loot_mode then
+    outcome.loot_status = "enabled"
+  else
+    outcome.loot_status = "disabled"
+  end if
+
+  missionActionOutcome = executeMissionAction(runState, acceptedAccess, acceptedRecord)
+  if missionActionOutcome != null then
+    outcome.mission_action_status = missionActionOutcome.status
+    if missionActionOutcome.records > 0 then outcome.loot_status = "records=" + missionActionOutcome.records
+    for noteLine in missionActionOutcome.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+  end if
+
+  if acceptedLevel == "guest" then
+    if runState.config.open_terminal then acceptedAccess.start_terminal
+    cleanupOutcome = cleanupAccessArtifacts(acceptedAccess, runState)
+    outcome.cleanup_status = cleanupOutcome.status
+    for noteLine in cleanupOutcome.notes
+      appendLine(outcome.notes, noteLine)
+    end for
+    outcome.status = "guest-shell"
+    runState.final_result = outcome
+    return outcome
+  end if
+
+  if acceptedType == "shell" then
+    explorerStatus = launchRemoteExplorer(acceptedAccess)
+    outcome.explorer_status = explorerStatus
+    if runState.config.open_terminal then acceptedAccess.start_terminal
+    outcome.status = "final-shell"
+  else
+    if runState.config.open_terminal then acceptedAccess.start_terminal
+    outcome.status = "terminal-access"
+  end if
+
+  cleanupOutcome = cleanupAccessArtifacts(acceptedAccess, runState)
+  outcome.cleanup_status = cleanupOutcome.status
+  for noteLine in cleanupOutcome.notes
+    appendLine(outcome.notes, noteLine)
+  end for
+
+  runState.final_result = outcome
+  return outcome
+end function
+
+shouldDeferCredentialReuseToRouterHandoff = function(runState)
+  if runState == null then return 0
+  if runState.accepted_shell == null then return 0
+
+  acceptedAccess = runState.accepted_shell
+  acceptedComputer = getAccessHostComputer(acceptedAccess)
+  acceptedRecord = findHostRecordForComputer(runState.ranked_hosts, acceptedComputer)
+  if acceptedRecord == null then acceptedRecord = runState.selected_host_record
+
+  return shouldAttemptRouterHandoff(runState, acceptedRecord, acceptedAccess)
+end function
+
+hasRecordedShellAccess = function(runState)
+  if runState == null then return 0
+  if runState.accepted_shell != null then return 1
+  if runState.provisional_shell != null then return 1
+  return 0
+end function
+
+printFinalSummary = function(finalResult)
+  if finalResult == null then return
+
+  print("CRS V1 final summary")
+  print("Status: " + formatValueDisplay(finalResult.status))
+  print("Accepted type: " + formatValueDisplay(finalResult.accepted_type))
+  print("Accepted access level: " + formatValueDisplay(finalResult.accepted_access_level))
+  print("Accepted host: " + formatValueDisplay(finalResult.accepted_host))
+  print("Explorer status: " + formatValueDisplay(finalResult.explorer_status))
+  print("Handoff status: " + formatValueDisplay(finalResult.handoff_status))
+  print("Stage status: " + formatValueDisplay(finalResult.stage_status))
+  print("Local recon status: " + formatValueDisplay(finalResult.local_recon_status))
+  print("Local next hop: " + formatValueDisplay(finalResult.local_recon_next_hop))
+  print("Mission action: " + formatValueDisplay(finalResult.mission_action_status))
+  print("Loot status: " + formatValueDisplay(finalResult.loot_status))
+  print("Cleanup status: " + formatValueDisplay(finalResult.cleanup_status))
+  print("")
+end function
+

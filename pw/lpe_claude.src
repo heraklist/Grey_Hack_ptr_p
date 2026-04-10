@@ -1,0 +1,255 @@
+// CRS tactical LPE worker v2
+// Runs on the victim host and reports progress through IPC and /tmp/lpe.status.
+// v2: dynamic /lib scanning, requirement-aware candidate prioritisation.
+
+metaxploit = include_lib("/lib/metaxploit.so")
+if not metaxploit then
+  metaxploit = include_lib(current_path + "/metaxploit.so")
+end if
+if not metaxploit then exit
+
+ipc = get_custom_object()
+worker_shell = get_shell
+if not worker_shell then exit
+worker_computer = worker_shell.host_computer
+if not worker_computer then exit
+
+NL = char(10)
+STATUS_FILE = "/tmp/lpe.status"
+STATUS_FILE_NAME = "lpe.status"
+PERSISTENCE_USER = "admin"
+PERSISTENCE_PASSWORD = "admin"
+
+
+// ------------------------------
+// Helpers
+// ------------------------------
+
+norm = function(value, defaultValue = "")
+  if value == null then return defaultValue
+  return str(value).trim
+end function
+
+norm_lower = function(value, defaultValue = "")
+  return norm(value, defaultValue).lower
+end function
+
+add_unique = function(values, candidate)
+  cleanCandidate = norm(candidate)
+  if cleanCandidate == "" then return 0
+
+  for existingValue in values
+    if existingValue == cleanCandidate then return 0
+  end for
+
+  values.push(cleanCandidate)
+  return 1
+end function
+
+write_status_file = function(statusPath, parentDir, fileName, statusText)
+  cleanStatus = norm(statusText)
+  if cleanStatus == "" then return 0
+  if norm(statusPath) == "" then return 0
+
+  statusFile = worker_computer.File(statusPath)
+  if statusFile == null then
+    createResult = worker_computer.touch(parentDir, fileName)
+    if createResult != 1 and createResult != true and createResult != null then return 0
+    statusFile = worker_computer.File(statusPath)
+  end if
+
+  if statusFile == null then return 0
+  if statusFile.is_folder then return 0
+  if not statusFile.has_permission("w") then return 0
+
+  writeResult = statusFile.set_content(cleanStatus)
+  if typeof(writeResult) == "string" and writeResult != "" then return 0
+  return 1
+end function
+
+write_status = function(statusText)
+  cleanStatus = norm(statusText)
+  ipc.lpe_status = cleanStatus
+
+  write_status_file(STATUS_FILE, "/tmp", STATUS_FILE_NAME, cleanStatus)
+
+  fallbackDir = norm(current_path)
+  if fallbackDir != "" and norm_lower(fallbackDir) != "/tmp" then
+    fallbackPath = fallbackDir + "/" + STATUS_FILE_NAME
+    write_status_file(fallbackPath, fallbackDir, STATUS_FILE_NAME, cleanStatus)
+  end if
+end function
+
+// Builds two lists from scan_address output:
+// - clean: candidates without requirements (no "*" in their segment)
+// - gated: candidates that have requirements
+// Returns a map {"clean": [...], "gated": [...]}
+partition_candidates = function(scanText)
+  clean = []
+  gated = []
+  remaining = "" + scanText
+
+  // Split on "Unsafe check: " to get per-vulnerability segments (docs pattern)
+  segments = remaining.split("Unsafe check: ")
+  if segments.len > 1 then
+    for seg in segments[1:]
+      // Extract the bold label
+      labelStart = seg.indexOf("<b>")
+      labelEnd = seg.indexOf("</b>")
+      if labelStart == null or labelEnd == null then continue
+
+      candidate = norm(seg[labelStart + 3 : labelEnd].replace("\r", "").replace("\n", ""))
+      if candidate == "" then continue
+
+      // Check for requirement markers ("*") in the segment
+      hasRequirement = seg.indexOf("*") != null
+
+      if hasRequirement then
+        add_unique(gated, candidate)
+      else
+        add_unique(clean, candidate)
+      end if
+    end for
+  end if
+
+  // Fallback: raw <b>…</b> extraction if split produced nothing
+  if clean.len == 0 and gated.len == 0 then
+    rem = "" + scanText
+    while 1
+      tagStart = rem.indexOf("<b>")
+      if tagStart == null then break
+      rem = rem[tagStart + 3:]
+      tagEnd = rem.indexOf("</b>")
+      if tagEnd == null then break
+      candidate = norm(rem[0:tagEnd].replace("\r", "").replace("\n", ""))
+      add_unique(clean, candidate)   // treat as clean when we have no segment context
+      if tagEnd + 4 >= rem.len then break
+      rem = rem[tagEnd + 4:]
+    end while
+  end if
+
+  return {"clean": clean, "gated": gated}
+end function
+
+// Returns an ordered list: clean candidates first, gated second.
+ordered_candidates = function(scanText)
+  parts = partition_candidates(scanText)
+  result = []
+  for c in parts.clean
+    add_unique(result, c)
+  end for
+  for c in parts.gated
+    add_unique(result, c)
+  end for
+  return result
+end function
+
+
+// ------------------------------
+// Dynamic lib discovery
+// ------------------------------
+
+// Scans /lib on the worker computer and returns a list of .so file paths.
+// Falls back to a hardcoded list if the folder is unreadable.
+discover_lib_paths = function()
+  libFolder = worker_computer.File("/lib")
+  if libFolder != null and libFolder.is_folder and libFolder.has_permission("r") then
+    paths = []
+    for f in libFolder.get_files
+      if f.is_folder then continue
+      fPath = norm(f.path)
+      if fPath == "" then continue
+      // Only attempt files with a .so extension
+      if fPath.len < 4 then continue
+      if fPath[fPath.len - 3:] != ".so" then continue
+      paths.push(fPath)
+    end for
+    if paths.len > 0 then return paths
+  end if
+
+  // Fallback
+  return ["/lib/init.so", "/lib/kernel_module.so", "/lib/net.so"]
+end function
+
+
+// ------------------------------
+// Persistence payload
+// ------------------------------
+
+apply_persistence = function(elevatedComputer)
+  persistenceReady = 0
+  persistenceStatus = ""
+
+  createResult = elevatedComputer.create_user(PERSISTENCE_USER, PERSISTENCE_PASSWORD)
+  if createResult == 1 or createResult == true then
+    persistenceReady = 1
+    persistenceStatus = "user-created"
+  else
+    changeResult = elevatedComputer.change_password(PERSISTENCE_USER, PERSISTENCE_PASSWORD)
+    if changeResult == 1 or changeResult == true then
+      persistenceReady = 1
+      persistenceStatus = "user-reset"
+    end if
+  end if
+
+  passwdReadable = 0
+  passwdFile = elevatedComputer.File("/etc/passwd")
+  if passwdFile != null and not passwdFile.is_folder then
+    chmodResult = passwdFile.chmod("o+r")
+    if typeof(chmodResult) != "string" or chmodResult == "" then passwdReadable = 1
+  end if
+
+  if persistenceReady then
+    return "success:" + persistenceStatus
+  else if passwdReadable then
+    return "partial:passwd-readable"
+  end if
+
+  return "failed:no-observable-artifact"
+end function
+
+
+// ------------------------------
+// Main LPE logic
+// ------------------------------
+
+write_status("searching")
+
+libPaths = discover_lib_paths()
+
+for libPath in libPaths
+  loadedLib = metaxploit.load(libPath)
+  if not loadedLib then continue
+
+  memoryZones = metaxploit.scan(loadedLib)
+  if memoryZones == null then continue
+  if typeof(memoryZones) == "string" then continue
+
+  for memoryZone in memoryZones
+    scanText = metaxploit.scan_address(loadedLib, memoryZone)
+    if typeof(scanText) != "string" then continue
+
+    candidates = ordered_candidates(scanText)
+    if candidates.len == 0 then continue
+
+    for candidate in candidates
+      overflowResult = loadedLib.overflow(memoryZone, candidate)
+      if overflowResult == null then continue
+
+      elevatedComputer = null
+      resultType = typeof(overflowResult)
+      if resultType == "shell" then
+        elevatedComputer = overflowResult.host_computer
+      else if resultType == "computer" then
+        elevatedComputer = overflowResult
+      end if
+      if elevatedComputer == null then continue
+
+      finalStatus = apply_persistence(elevatedComputer)
+      write_status(finalStatus)
+      exit
+    end for
+  end for
+end for
+
+write_status("failed:no-hit")

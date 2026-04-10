@@ -1,0 +1,170 @@
+// CRS tactical LPE worker
+// Runs on the victim host and reports progress through IPC and /tmp/lpe.status.
+
+metaxploit = include_lib("/lib/metaxploit.so")
+if not metaxploit then
+  metaxploit = include_lib(current_path + "/metaxploit.so")
+end if
+if not metaxploit then exit
+
+ipc = get_custom_object()
+worker_shell = get_shell
+if not worker_shell then exit
+worker_computer = worker_shell.host_computer
+if not worker_computer then exit
+
+NL = char(10)
+STATUS_FILE = "/tmp/lpe.status"
+STATUS_FILE_NAME = "lpe.status"
+PERSISTENCE_USER = "admin"
+PERSISTENCE_PASSWORD = "admin"
+TARGET_LIBS = ["/lib/init.so", "/lib/kernel_module.so", "/lib/net.so"]
+
+norm = function(value, defaultValue = "")
+  if value == null then return defaultValue
+  return str(value).trim
+end function
+
+norm_lower = function(value, defaultValue = "")
+  return norm(value, defaultValue).lower
+end function
+
+add_unique = function(values, candidate)
+  cleanCandidate = norm(candidate)
+  if cleanCandidate == "" then return 0
+
+  for existingValue in values
+    if existingValue == cleanCandidate then return 0
+  end for
+
+  values.push(cleanCandidate)
+  return 1
+end function
+
+write_status_file = function(statusPath, parentDir, fileName, statusText)
+  cleanStatus = norm(statusText)
+  if cleanStatus == "" then return 0
+  if norm(statusPath) == "" then return 0
+
+  statusFile = worker_computer.File(statusPath)
+  if statusFile == null then
+    createResult = worker_computer.touch(parentDir, fileName)
+    if createResult != 1 and createResult != true and createResult != null then return 0
+    statusFile = worker_computer.File(statusPath)
+  end if
+
+  if statusFile == null then return 0
+  if statusFile.is_folder then return 0
+  if not statusFile.has_permission("w") then return 0
+
+  writeResult = statusFile.set_content(cleanStatus)
+  if typeof(writeResult) == "string" and writeResult != "" then return 0
+  return 1
+end function
+
+write_status = function(statusText)
+  cleanStatus = norm(statusText)
+  ipc.lpe_status = cleanStatus
+
+  write_status_file(STATUS_FILE, "/tmp", STATUS_FILE_NAME, cleanStatus)
+
+  fallbackDir = norm(current_path)
+  if fallbackDir != "" and norm_lower(fallbackDir) != "/tmp" then
+    fallbackPath = fallbackDir + "/" + STATUS_FILE_NAME
+    write_status_file(fallbackPath, fallbackDir, STATUS_FILE_NAME, cleanStatus)
+  end if
+end function
+
+extract_candidates = function(scanText)
+  candidates = []
+  remaining = "" + scanText
+
+  while 1
+    tagStart = remaining.indexOf("<b>")
+    if tagStart == null then break
+
+    remaining = remaining[tagStart + 3:]
+    tagEnd = remaining.indexOf("</b>")
+    if tagEnd == null then break
+
+    candidate = remaining[0:tagEnd].replace("\r", "").replace("\n", "")
+    add_unique(candidates, candidate)
+
+    if tagEnd + 4 >= remaining.len then break
+    remaining = remaining[tagEnd + 4:]
+  end while
+
+  if candidates.len == 0 then
+    for rawLine in ("" + scanText).split(NL)
+      cleanLine = norm(rawLine.replace("<b>", "").replace("</b>", "").replace("\r", ""))
+      if cleanLine == "" then continue
+      if cleanLine.lower.indexOf("unchecked") == null then continue
+      add_unique(candidates, cleanLine)
+    end for
+  end if
+
+  return candidates
+end function
+
+write_status("searching")
+
+for libPath in TARGET_LIBS
+  loadedLib = metaxploit.load(libPath)
+  if not loadedLib then continue
+
+  memoryZones = metaxploit.scan(loadedLib)
+  if memoryZones == null then continue
+  if typeof(memoryZones) == "string" then continue
+
+  for memoryZone in memoryZones
+    scanText = metaxploit.scan_address(loadedLib, memoryZone)
+    if typeof(scanText) != "string" then continue
+
+    for candidate in extract_candidates(scanText)
+      overflowResult = loadedLib.overflow(memoryZone, candidate)
+      if overflowResult == null then continue
+
+      elevatedComputer = null
+      resultType = typeof(overflowResult)
+      if resultType == "shell" then
+        elevatedComputer = overflowResult.host_computer
+      else if resultType == "computer" then
+        elevatedComputer = overflowResult
+      end if
+      if elevatedComputer == null then continue
+
+      persistenceReady = 0
+      persistenceStatus = ""
+      createResult = elevatedComputer.create_user(PERSISTENCE_USER, PERSISTENCE_PASSWORD)
+      if createResult == 1 or createResult == true then
+        persistenceReady = 1
+        persistenceStatus = "user-created"
+      else
+        changeResult = elevatedComputer.change_password(PERSISTENCE_USER, PERSISTENCE_PASSWORD)
+        if changeResult == 1 or changeResult == true then
+          persistenceReady = 1
+          persistenceStatus = "user-reset"
+        end if
+      end if
+
+      passwdReadable = 0
+      passwdFile = elevatedComputer.File("/etc/passwd")
+      if passwdFile != null and not passwdFile.is_folder then
+        chmodResult = passwdFile.chmod("o+r")
+        if typeof(chmodResult) != "string" or chmodResult == "" then passwdReadable = 1
+      end if
+
+      if persistenceReady then
+        write_status("success:" + persistenceStatus)
+      else if passwdReadable then
+        write_status("partial:passwd-readable")
+      else
+        write_status("failed:no-observable-artifact")
+      end if
+
+      exit
+    end for
+  end for
+end for
+
+write_status("failed:no-hit")

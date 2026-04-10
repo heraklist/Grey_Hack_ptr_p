@@ -1,0 +1,914 @@
+// Grey Hack CRS suite
+// Phase 1: core, config, discovery, mapper import, host menu.
+
+NL = char(10)
+CR = char(13)
+TAB = char(9)
+COMMON_SERVICE_PORTS = [21, 22, 25, 80, 141, 8080, 1222, 1542, 1883, 3306, 5555]
+DEEP_SERVICE_PORTS = [21, 22, 25, 53, 80, 110, 111, 139, 141, 143, 443, 445, 587, 993, 995, 1222, 1542, 1883, 3306, 5432, 5555, 8080]
+SCRIPT_BUILD = "2026-04-03-phase1-discovery-a"
+
+appendLine = function(lines, text)
+  lines.push(text)
+end function
+
+isError = function(value)
+  return value isa string and value != ""
+end function
+
+normalizeInput = function(value)
+  if value == null then return ""
+  return str(value)
+end function
+
+normalizeText = function(value)
+  clean = ""
+  for ch in normalizeInput(value)
+    if ch != CR then clean = clean + ch
+  end for
+  return clean
+end function
+
+listHasValue = function(items, wanted)
+  if items == null then return 0
+  for item in items
+    if item == wanted then return 1
+  end for
+  return 0
+end function
+
+toYesNoFlag = function(inputValue, defaultValue = 1)
+  lowered = normalizeInput(inputValue).trim.lower
+  if lowered == "" then return defaultValue
+  if lowered == "y" or lowered == "yes" or lowered == "1" or lowered == "true" then return 1
+  if lowered == "n" or lowered == "no" or lowered == "0" or lowered == "false" then return 0
+  return defaultValue
+end function
+
+normalizeRunMode = function(inputValue, defaultValue = "auto")
+  lowered = normalizeInput(inputValue).trim.lower
+  if lowered == "" then return defaultValue
+  if lowered == "auto" or lowered == "a" then return "auto"
+  if lowered == "discover" or lowered == "discovery" or lowered == "recon" then return "discover"
+  if lowered == "lan" then return "lan"
+  if lowered == "access" then return "access"
+  if lowered == "creds" or lowered == "credentials" then return "creds"
+  return defaultValue
+end function
+
+getParamValue = function(flagName, defaultValue = "")
+  if params == null then return defaultValue
+  flagIndex = params.indexOf(flagName)
+  if flagIndex == null then return defaultValue
+
+  nextIndex = flagIndex + 1
+  if not params.hasIndex(nextIndex) then return defaultValue
+  return params[nextIndex]
+end function
+
+getParamFlag = function(flagName, defaultValue = 0)
+  return toYesNoFlag(getParamValue(flagName, ""), defaultValue)
+end function
+
+ensureFolder = function(computer, parentPath, folderName)
+  folderPath = parentPath + "/" + folderName
+  folder = computer.File(folderPath)
+  if folder != null then return folderPath
+
+  created = computer.create_folder(parentPath, folderName)
+  if created == 1 then return folderPath
+  return null
+end function
+
+ensureTextFile = function(computer, dirPath, fileName)
+  filePath = dirPath + "/" + fileName
+  file = computer.File(filePath)
+  if file != null then return file
+
+  created = computer.touch(dirPath, fileName)
+  if isError(created) then return null
+  return computer.File(filePath)
+end function
+
+readTextFile = function(file)
+  if file == null then return null
+  if file.is_folder then return null
+  if file.is_binary then return null
+  if not file.has_permission("r") then return null
+  return normalizeInput(file.get_content)
+end function
+
+resolveOutputDir = function(computer, sharedDir = "")
+  normalizedSharedDir = normalizeInput(sharedDir).trim
+  if normalizedSharedDir != "" then
+    sharedFolder = computer.File(normalizedSharedDir)
+    if sharedFolder != null and sharedFolder.is_folder and sharedFolder.has_permission("w") then return normalizedSharedDir
+  end if
+
+  outputDir = ensureFolder(computer, home_dir, "loot")
+  if outputDir == null then outputDir = home_dir
+  return outputDir
+end function
+
+splitIpParts = function(ipAddress)
+  ipText = normalizeInput(ipAddress)
+  if ipText == "" then return []
+
+  parts = []
+  current = ""
+  for ch in ipText
+    if ch == "." then
+      parts.push(current)
+      current = ""
+    else
+      current = current + ch
+    end if
+  end for
+
+  parts.push(current)
+  return parts
+end function
+
+isNumericText = function(textValue)
+  text = normalizeInput(textValue)
+  if text == "" then return 0
+
+  for ch in text
+    if ch < "0" or ch > "9" then return 0
+  end for
+
+  return 1
+end function
+
+isValidIpAddress = function(ipAddress)
+  parts = splitIpParts(ipAddress)
+  if parts == null or parts.len != 4 then return 0
+
+  for part in parts
+    if not isNumericText(part) then return 0
+    partValue = part.val
+    if partValue < 0 or partValue > 255 then return 0
+  end for
+
+  return 1
+end function
+
+inferGatewayIp = function(ipAddress)
+  parts = splitIpParts(ipAddress)
+  if parts == null or parts.len != 4 then return ""
+  return parts[0] + "." + parts[1] + "." + parts[2] + ".1"
+end function
+
+subnetKey = function(ipAddress)
+  parts = splitIpParts(ipAddress)
+  if parts == null or parts.len != 4 then return normalizeInput(ipAddress)
+  return parts[0] + "." + parts[1] + "." + parts[2]
+end function
+
+isLikelyRouterLanIp = function(ipAddress)
+  parts = splitIpParts(ipAddress)
+  if parts == null or parts.len != 4 then return 0
+  return parts[3] == "1"
+end function
+
+splitCsvValues = function(textValue)
+  values = []
+  seen = []
+
+  for rawPart in normalizeInput(textValue).split(",")
+    value = normalizeInput(rawPart).trim
+    if value == "" then continue
+
+    lowered = value.lower
+    if listHasValue(seen, lowered) then continue
+    seen.push(lowered)
+    values.push(value)
+  end for
+
+  return values
+end function
+
+parsePortList = function(textValue)
+  ports = []
+  seen = []
+
+  for rawPart in splitCsvValues(textValue)
+    if not isNumericText(rawPart) then continue
+
+    portNumber = rawPart.val
+    if portNumber < 0 then continue
+    if listHasValue(seen, "" + portNumber) then continue
+
+    seen.push("" + portNumber)
+    ports.push(portNumber)
+  end for
+
+  return ports
+end function
+
+parseLowerList = function(textValue)
+  values = []
+  seen = []
+
+  for rawPart in splitCsvValues(textValue)
+    lowered = rawPart.lower
+    if listHasValue(seen, lowered) then continue
+    seen.push(lowered)
+    values.push(lowered)
+  end for
+
+  return values
+end function
+
+makeRunConfig = function(mode, targetIp, victimLanIp, targetUser, mapperFile, deepRecon, targetMenu, quietMode, nonInteractive)
+  return {
+    "mode": mode,
+    "target_ip": targetIp,
+    "victim_lan_ip": victimLanIp,
+    "target_user": targetUser,
+    "mapper_file": mapperFile,
+    "deep_recon": deepRecon,
+    "target_menu": targetMenu,
+    "quiet_mode": quietMode,
+    "non_interactive": nonInteractive,
+  }
+end function
+
+makeHostRecord = function(ipAddress, roleText, priorityText, scoreValue, openPorts, sourceText)
+  return {
+    "ip": ipAddress,
+    "role": roleText,
+    "priority": priorityText,
+    "score": scoreValue,
+    "open_ports": openPorts,
+    "source": sourceText,
+  }
+end function
+
+makeTarget = function(ipAddress, portNumber, labelText, expectedLanIp = "")
+  return {
+    "ip": ipAddress,
+    "port": portNumber,
+    "label": labelText,
+    "expected_lan_ip": expectedLanIp,
+  }
+end function
+
+serviceName = function(portNumber)
+  if portNumber == 0 then return "router-kernel"
+  if portNumber == 53 then return "dns"
+  if portNumber == 110 then return "pop3"
+  if portNumber == 111 then return "rpc"
+  if portNumber == 139 then return "netbios"
+  if portNumber == 143 then return "imap"
+  if portNumber == 21 then return "ftp"
+  if portNumber == 22 then return "ssh"
+  if portNumber == 25 then return "smtp"
+  if portNumber == 80 then return "http"
+  if portNumber == 443 then return "https"
+  if portNumber == 445 then return "smb"
+  if portNumber == 587 then return "smtp-submission"
+  if portNumber == 993 then return "imaps"
+  if portNumber == 995 then return "pop3s"
+  if portNumber == 141 then return "bank-sql"
+  if portNumber == 8080 then return "router-http"
+  if portNumber == 1222 then return "rshell"
+  if portNumber == 1542 then return "repository"
+  if portNumber == 1883 then return "smart-appliance"
+  if portNumber == 3306 then return "sql"
+  if portNumber == 5432 then return "postgres"
+  if portNumber == 5555 then return "adb"
+  return "unknown"
+end function
+
+serviceWeight = function(portNumber)
+  if portNumber == 21 then return 3
+  if portNumber == 22 then return 3
+  if portNumber == 25 then return 3
+  if portNumber == 53 then return 2
+  if portNumber == 80 then return 4
+  if portNumber == 141 then return 5
+  if portNumber == 443 then return 4
+  if portNumber == 3306 then return 5
+  if portNumber == 5432 then return 5
+  if portNumber == 8080 then return 3
+  if portNumber == 1222 then return 4
+  if portNumber == 1542 then return 4
+  if portNumber == 1883 then return 2
+  if portNumber == 5555 then return 4
+  return 1
+end function
+
+priorityLabel = function(scoreValue)
+  if scoreValue >= 8 then return "high"
+  if scoreValue >= 4 then return "medium"
+  return "low"
+end function
+
+hostRoleGuess = function(ipAddress, openPorts)
+  if isLikelyRouterLanIp(ipAddress) then
+    if openPorts == null or openPorts.len == 0 then return "adjacent-gateway"
+    return "gateway"
+  end if
+
+  if openPorts == null or openPorts.len == 0 then return "host"
+
+  for portInfo in openPorts
+    if portInfo.port == 3306 or portInfo.port == 5432 or portInfo.port == 141 then return "data-server"
+    if portInfo.port == 80 or portInfo.port == 443 or portInfo.port == 8080 then return "web-server"
+    if portInfo.port == 25 then return "mail-server"
+    if portInfo.port == 1883 then return "iot-device"
+    if portInfo.port == 1542 then return "repository-server"
+  end for
+
+  return "host"
+end function
+
+collectOpenPorts = function(router, ipAddress)
+  openPorts = []
+  if router == null then return openPorts
+
+  ports = router.device_ports(ipAddress)
+  if ports == null then return openPorts
+
+  for portObj in ports
+    if portObj == null then continue
+    if portObj.is_closed then continue
+
+    openPorts.push({
+      "port": portObj.port_number,
+      "service": serviceName(portObj.port_number),
+    })
+  end for
+
+  return openPorts
+end function
+
+scoreHost = function(ipAddress, openPorts)
+  score = 0
+  if isLikelyRouterLanIp(ipAddress) then score = score + 1
+  if openPorts == null then return score
+
+  for portInfo in openPorts
+    score = score + serviceWeight(portInfo.port)
+  end for
+
+  return score
+end function
+
+formatOpenPorts = function(openPorts)
+  if openPorts == null or openPorts.len == 0 then return "none"
+
+  parts = []
+  for portInfo in openPorts
+    if portInfo == null then continue
+    parts.push(portInfo.port + " (" + serviceName(portInfo.port) + ")")
+  end for
+
+  if parts.len == 0 then return "none"
+  return parts.join(", ")
+end function
+
+formatPortNumbers = function(openPorts)
+  if openPorts == null or openPorts.len == 0 then return "none"
+
+  parts = []
+  for portInfo in openPorts
+    if portInfo == null then continue
+    parts.push("" + portInfo.port)
+  end for
+
+  if parts.len == 0 then return "none"
+  return parts.join(",")
+end function
+
+rankHostRecords = function(hostRecords, preferredIp = "")
+  ranked = []
+  used = []
+  if hostRecords == null then return ranked
+
+  while used.len < hostRecords.len
+    bestRecord = null
+    bestScore = -999999
+    bestKey = ""
+
+    for hostRecord in hostRecords
+      if hostRecord == null then continue
+
+      hostKey = normalizeInput(hostRecord.ip)
+      if hostKey == "" then continue
+      if listHasValue(used, hostKey) then continue
+
+      hostScore = hostRecord.score
+      if preferredIp != "" and hostRecord.ip == preferredIp then hostScore = hostScore + 100
+      if normalizeInput(hostRecord.priority) == "high" then hostScore = hostScore + 20
+      if normalizeInput(hostRecord.role).indexOf("gateway") != null then hostScore = hostScore + 5
+
+      if bestRecord == null or hostScore > bestScore then
+        bestRecord = hostRecord
+        bestScore = hostScore
+        bestKey = hostKey
+      else
+        if hostScore == bestScore and hostRecord.ip < bestRecord.ip then
+          bestRecord = hostRecord
+          bestScore = hostScore
+          bestKey = hostKey
+        end if
+      end if
+    end for
+
+    if bestRecord == null then break
+    used.push(bestKey)
+    ranked.push(bestRecord)
+  end while
+
+  return ranked
+end function
+
+buildRouterHostRecords = function(router, preferredIp = "")
+  hostRecords = []
+  if router == null then return hostRecords
+
+  lanIps = router.devices_lan_ip
+  if lanIps == null then return hostRecords
+
+  for lanIp in lanIps
+    openPorts = collectOpenPorts(router, lanIp)
+    hostRecords.push(makeHostRecord(lanIp, hostRoleGuess(lanIp, openPorts), priorityLabel(scoreHost(lanIp, openPorts)), scoreHost(lanIp, openPorts), openPorts, "router-discovery"))
+  end for
+
+  return rankHostRecords(hostRecords, preferredIp)
+end function
+
+parseHostPortsText = function(textValue)
+  openPorts = []
+  seen = []
+  cleanText = normalizeInput(textValue).trim
+  if cleanText == "" or cleanText.lower == "none" then return openPorts
+
+  for rawPart in cleanText.split(",")
+    part = normalizeInput(rawPart).trim
+    if part == "" then continue
+
+    portText = part
+    if part.indexOf(" ") != null then portText = part.split(" ")[0]
+    if not isNumericText(portText) then continue
+
+    portNumber = portText.val
+    if listHasValue(seen, "" + portNumber) then continue
+    seen.push("" + portNumber)
+    openPorts.push({
+      "port": portNumber,
+      "service": serviceName(portNumber),
+    })
+  end for
+
+  return openPorts
+end function
+
+parseMapperHostLine = function(lineText)
+  parsed = null
+  cleanLine = normalizeInput(lineText).trim
+  if cleanLine == "" then return null
+
+  if cleanLine.indexOf(TAB) != null then
+    parts = cleanLine.split(TAB)
+    if parts != null and parts.len >= 4 then
+      ipAddress = normalizeInput(parts[0]).trim
+      if isValidIpAddress(ipAddress) then
+        roleText = normalizeInput(parts[1]).trim
+        priorityText = normalizeInput(parts[2]).trim.lower
+        scoreValue = 0
+        if isNumericText(normalizeInput(parts[3]).trim) then scoreValue = normalizeInput(parts[3]).trim.val
+        portsText = ""
+        if parts.len > 4 then portsText = normalizeInput(parts[4]).trim
+        return makeHostRecord(ipAddress, roleText, priorityText, scoreValue, parseHostPortsText(portsText), "mapper-file")
+      end if
+    end if
+  end if
+
+  if cleanLine.indexOf("|") == null then return null
+  parts = cleanLine.split("|")
+  if parts == null or parts.len < 2 then return null
+
+  ipAddress = normalizeInput(parts[0]).trim
+  if not isValidIpAddress(ipAddress) then return null
+
+  roleText = normalizeInput(parts[1]).trim
+  priorityText = ""
+  scoreValue = 0
+  portsText = "none"
+
+  for part in parts[2:]
+    cleanPart = normalizeInput(part).trim
+    loweredPart = cleanPart.lower
+
+    if loweredPart.indexOf("priority=") == 0 then
+      priorityText = cleanPart.split("=")[1].trim.lower
+      continue
+    end if
+
+    if loweredPart.indexOf("score=") == 0 then
+      scoreText = cleanPart.split("=")[1].trim
+      if isNumericText(scoreText) then scoreValue = scoreText.val
+      continue
+    end if
+
+    portsText = cleanPart
+  end for
+
+  openPorts = parseHostPortsText(portsText)
+  if scoreValue == 0 and openPorts.len > 0 then scoreValue = scoreHost(ipAddress, openPorts)
+  if priorityText == "" then priorityText = priorityLabel(scoreValue)
+  if roleText == "" then roleText = hostRoleGuess(ipAddress, openPorts)
+
+  return makeHostRecord(ipAddress, roleText, priorityText, scoreValue, openPorts, "mapper-file")
+end function
+
+loadMapperHostRecords = function(computer, mapperPath)
+  mapperData = {
+    "router_public_ip": "",
+    "router_local_ip": "",
+    "hosts": [],
+    "path": "",
+  }
+
+  normalizedPath = normalizeInput(mapperPath).trim
+  if normalizedPath == "" then return mapperData
+  if computer == null then return mapperData
+
+  mapperFile = computer.File(normalizedPath)
+  if mapperFile == null then return mapperData
+
+  content = readTextFile(mapperFile)
+  if content == null or content == "" then return mapperData
+
+  mapperData.path = mapperFile.path
+  seenHosts = []
+
+  for rawLine in content.split(NL)
+    lineText = normalizeInput(rawLine).trim
+    if lineText == "" then continue
+
+    loweredLine = lineText.lower
+    if loweredLine.indexOf("router public ip:") == 0 then
+      routerParts = lineText.split(":")
+      if routerParts != null and routerParts.len > 1 then mapperData.router_public_ip = normalizeInput(routerParts[1]).trim
+      continue
+    end if
+
+    if loweredLine.indexOf("router local ip:") == 0 then
+      routerParts = lineText.split(":")
+      if routerParts != null and routerParts.len > 1 then mapperData.router_local_ip = normalizeInput(routerParts[1]).trim
+      continue
+    end if
+
+    hostRecord = parseMapperHostLine(lineText)
+    if hostRecord == null then continue
+    if listHasValue(seenHosts, hostRecord.ip) then continue
+
+    seenHosts.push(hostRecord.ip)
+    mapperData.hosts.push(hostRecord)
+  end for
+
+  mapperData.hosts = rankHostRecords(mapperData.hosts)
+  return mapperData
+end function
+
+knownServicePorts = function(deepRecon = 0)
+  if deepRecon then return DEEP_SERVICE_PORTS
+  return COMMON_SERVICE_PORTS
+end function
+
+pushUniqueTarget = function(targets, seen, ipAddress, portNumber, labelText, expectedLanIp = "")
+  key = normalizeInput(ipAddress) + ":" + portNumber
+  if listHasValue(seen, key) then return
+
+  seen.push(key)
+  targets.push(makeTarget(ipAddress, portNumber, labelText, expectedLanIp))
+end function
+
+buildTargetsFromHostRecords = function(hostRecords, deepRecon = 0)
+  targets = []
+  seen = []
+  if hostRecords == null then return targets
+
+  for hostRecord in hostRecords
+    if hostRecord == null then continue
+    ipAddress = normalizeInput(hostRecord.ip)
+    if ipAddress == "" then continue
+
+    if normalizeInput(hostRecord.role).indexOf("gateway") != null or isLikelyRouterLanIp(ipAddress) then
+      pushUniqueTarget(targets, seen, ipAddress, 0, "router-kernel", ipAddress)
+    end if
+
+    if hostRecord.open_ports != null and hostRecord.open_ports.len > 0 then
+      for portInfo in hostRecord.open_ports
+        if portInfo == null then continue
+        pushUniqueTarget(targets, seen, ipAddress, portInfo.port, "host-" + normalizeInput(hostRecord.priority), ipAddress)
+      end for
+    else
+      for portNumber in knownServicePorts(deepRecon)
+        pushUniqueTarget(targets, seen, ipAddress, portNumber, "fallback-" + normalizeInput(hostRecord.priority), ipAddress)
+      end for
+    end if
+  end for
+
+  return targets
+end function
+
+buildPublicFallbackTargets = function(targetIp, deepRecon = 0)
+  targets = []
+  seen = []
+  if targetIp == "" then return targets
+
+  pushUniqueTarget(targets, seen, targetIp, 0, "public-router-fallback")
+  for portNumber in knownServicePorts(deepRecon)
+    pushUniqueTarget(targets, seen, targetIp, portNumber, "public-service-fallback")
+  end for
+
+  return targets
+end function
+
+filterTargetsBySelectedHost = function(targets, selectedHostIp)
+  filtered = []
+  wantedIp = normalizeInput(selectedHostIp).trim
+  if wantedIp == "" then return targets
+  if targets == null then return filtered
+
+  for target in targets
+    if target == null then continue
+    if target.ip == wantedIp or target.expected_lan_ip == wantedIp then filtered.push(target)
+  end for
+
+  if filtered.len > 0 then return filtered
+  return targets
+end function
+
+targetPriorityScore = function(target, requestedIp = "", requestedLanIp = "")
+  if target == null then return -999999
+
+  score = serviceWeight(target.port) * 10
+  if target.port == 0 then score = score - 10
+  if normalizeInput(target.label).indexOf("fallback") != null then score = score - 5
+
+  if requestedIp != "" and target.ip == requestedIp then score = score + 120
+  if requestedLanIp != "" then
+    if target.ip == requestedLanIp then score = score + 160
+    if target.expected_lan_ip == requestedLanIp then score = score + 120
+    if inferGatewayIp(requestedLanIp) == target.ip then score = score + 60
+  end if
+
+  return score
+end function
+
+rankTargets = function(targets, requestedIp = "", requestedLanIp = "")
+  rankedTargets = []
+  used = []
+  if targets == null then return rankedTargets
+
+  while used.len < targets.len
+    bestTarget = null
+    bestKey = ""
+    bestScore = -999999
+
+    for target in targets
+      if target == null then continue
+      targetKey = target.ip + ":" + target.port + ":" + normalizeInput(target.label)
+      if listHasValue(used, targetKey) then continue
+
+      targetScore = targetPriorityScore(target, requestedIp, requestedLanIp)
+      if bestTarget == null or targetScore > bestScore then
+        bestTarget = target
+        bestKey = targetKey
+        bestScore = targetScore
+      else
+        if targetScore == bestScore and target.port < bestTarget.port then
+          bestTarget = target
+          bestKey = targetKey
+          bestScore = targetScore
+        end if
+      end if
+    end for
+
+    if bestTarget == null then break
+    used.push(bestKey)
+    rankedTargets.push(bestTarget)
+  end while
+
+  return rankedTargets
+end function
+
+promptTargetHostMenu = function(hostRecords, requestedIp = "", requestedLanIp = "")
+  if hostRecords == null or hostRecords.len == 0 then return ""
+
+  rankedHosts = rankHostRecords(hostRecords, requestedLanIp)
+  print("CRS target host menu")
+  hostIndex = 1
+  for hostRecord in rankedHosts
+    print("" + hostIndex + ". " + hostRecord.ip + " | " + hostRecord.role + " | priority=" + hostRecord.priority + " | score=" + hostRecord.score + " | " + formatOpenPorts(hostRecord.open_ports))
+    hostIndex = hostIndex + 1
+  end for
+
+  selectedInput = normalizeInput(user_input("Target host [1-" + rankedHosts.len + ", blank=auto]: ")).trim
+  if selectedInput == "" then return ""
+  if not isNumericText(selectedInput) then return ""
+
+  selectedIndex = selectedInput.val - 1
+  if selectedIndex < 0 or selectedIndex >= rankedHosts.len then return ""
+  return rankedHosts[selectedIndex].ip
+end function
+
+saveDiscoveryOutputs = function(computer, outputDir, reportLines, hostRecords, targets)
+  reportFile = ensureTextFile(computer, outputDir, "crs_report.txt")
+  if reportFile == null then return "Unable to create CRS report"
+
+  hostsFile = ensureTextFile(computer, outputDir, "crs_hosts.tsv")
+  if hostsFile == null then return "Unable to create CRS host list"
+
+  targetsFile = ensureTextFile(computer, outputDir, "crs_targets.txt")
+  if targetsFile == null then return "Unable to create CRS target list"
+
+  hostLines = ["ip" + TAB + "role" + TAB + "priority" + TAB + "score" + TAB + "ports" + TAB + "source"]
+  if hostRecords != null then
+    for hostRecord in hostRecords
+      if hostRecord == null then continue
+      appendLine(hostLines, hostRecord.ip + TAB + hostRecord.role + TAB + hostRecord.priority + TAB + hostRecord.score + TAB + formatPortNumbers(hostRecord.open_ports) + TAB + hostRecord.source)
+    end for
+  end if
+
+  targetLines = []
+  if targets != null then
+    for target in targets
+      if target == null then continue
+      appendLine(targetLines, target.ip + ":" + target.port + " [" + target.label + "]")
+    end for
+  end if
+
+  saveReportResult = reportFile.set_content(reportLines.join(NL))
+  if isError(saveReportResult) then return saveReportResult
+
+  saveHostsResult = hostsFile.set_content(hostLines.join(NL))
+  if isError(saveHostsResult) then return saveHostsResult
+
+  saveTargetsResult = targetsFile.set_content(targetLines.join(NL))
+  if isError(saveTargetsResult) then return saveTargetsResult
+
+  return {
+    "report_path": reportFile.path,
+    "hosts_path": hostsFile.path,
+    "targets_path": targetsFile.path,
+  }
+end function
+
+shell = get_shell
+if shell == null then exit("Could not access current shell")
+
+computer = shell.host_computer
+if computer == null then exit("Could not access host computer")
+
+argMode = normalizeRunMode(getParamValue("--mode", ""), "auto")
+targetIp = normalizeInput(getParamValue("--target-ip", "")).trim
+victimLanIp = normalizeInput(getParamValue("--victim-lan-ip", "")).trim
+targetUser = normalizeInput(getParamValue("--target-user", "")).trim
+mapperFilePath = normalizeInput(getParamValue("--mapper-file", "")).trim
+sharedDir = normalizeInput(getParamValue("--shared-dir", "")).trim
+deepRecon = getParamFlag("--deep-recon", 0)
+nonInteractive = getParamFlag("--non-interactive", 0)
+quietMode = getParamFlag("--quiet", 0)
+targetMenuValue = getParamValue("--target-menu", "")
+targetMenu = toYesNoFlag(targetMenuValue, 0)
+
+if targetIp != "" and not isValidIpAddress(targetIp) then exit("Invalid target IP: " + targetIp)
+if victimLanIp != "" and not isValidIpAddress(victimLanIp) then exit("Invalid victim LAN IP: " + victimLanIp)
+
+if targetIp == "" and mapperFilePath == "" and not nonInteractive then
+  targetIp = normalizeInput(user_input("Target IP [blank=current LAN/mapped discovery]: ")).trim
+  if targetIp != "" and not isValidIpAddress(targetIp) then exit("Invalid target IP: " + targetIp)
+end if
+
+mode = argMode
+if mode == "auto" then
+  if targetIp != "" then
+    mode = "discover"
+  else
+    mode = "lan"
+  end if
+end if
+
+mapperData = loadMapperHostRecords(computer, mapperFilePath)
+mapperHosts = mapperData.hosts
+discoveredHosts = []
+candidateHosts = mapperHosts
+targetDiscoveryNote = ""
+targetSelectionNote = ""
+
+if candidateHosts.len == 0 then
+  if targetIp != "" then
+    targetRouter = get_router(targetIp)
+    if targetRouter != null then
+      discoveredHosts = buildRouterHostRecords(targetRouter, victimLanIp)
+      if discoveredHosts.len > 0 then targetDiscoveryNote = "Discovered " + discoveredHosts.len + " LAN hosts behind the requested public IP."
+    else
+      targetDiscoveryNote = "No router object available for requested public IP; using public fallback targets."
+    end if
+  else
+    currentRouter = get_router
+    if currentRouter != null then
+      discoveredHosts = buildRouterHostRecords(currentRouter, victimLanIp)
+      if discoveredHosts.len > 0 then targetDiscoveryNote = "Using current router LAN discovery."
+    else
+      targetDiscoveryNote = "No mapper file and no current router available."
+    end if
+  end if
+end if
+
+if candidateHosts.len == 0 then candidateHosts = discoveredHosts
+if targetMenuValue == "" and victimLanIp == "" and candidateHosts.len > 0 and not nonInteractive then targetMenu = 1
+if nonInteractive then targetMenu = 0
+
+selectedHostIp = ""
+if targetMenu and candidateHosts.len > 0 then
+  selectedHostIp = promptTargetHostMenu(candidateHosts, targetIp, victimLanIp)
+  if selectedHostIp != "" then
+    victimLanIp = selectedHostIp
+    targetSelectionNote = "Selected victim LAN IP from host menu: " + selectedHostIp
+  end if
+end if
+
+targets = []
+if candidateHosts.len > 0 then
+  targets = buildTargetsFromHostRecords(candidateHosts, deepRecon)
+else
+  targets = buildPublicFallbackTargets(targetIp, deepRecon)
+end if
+
+targets = filterTargetsBySelectedHost(targets, victimLanIp)
+targets = rankTargets(targets, targetIp, victimLanIp)
+
+runConfig = makeRunConfig(mode, targetIp, victimLanIp, targetUser, mapperFilePath, deepRecon, targetMenu, quietMode, nonInteractive)
+outputDir = resolveOutputDir(computer, sharedDir)
+reportLines = []
+
+appendLine(reportLines, "Grey Hack CRS Report")
+appendLine(reportLines, "Build: " + SCRIPT_BUILD)
+appendLine(reportLines, "Date: " + current_date)
+appendLine(reportLines, "User: " + active_user)
+appendLine(reportLines, "Mode: " + runConfig.mode)
+appendLine(reportLines, "Target IP: " + runConfig.target_ip)
+appendLine(reportLines, "Victim LAN IP: " + runConfig.victim_lan_ip)
+appendLine(reportLines, "Target user: " + runConfig.target_user)
+appendLine(reportLines, "Mapper file: " + runConfig.mapper_file)
+appendLine(reportLines, "Target menu: " + runConfig.target_menu)
+appendLine(reportLines, "Deep recon: " + runConfig.deep_recon)
+appendLine(reportLines, "Quiet mode: " + runConfig.quiet_mode)
+appendLine(reportLines, "Output dir: " + outputDir)
+if targetDiscoveryNote != "" then appendLine(reportLines, "Discovery note: " + targetDiscoveryNote)
+if targetSelectionNote != "" then appendLine(reportLines, "Selection note: " + targetSelectionNote)
+appendLine(reportLines, "")
+
+appendLine(reportLines, "Host candidates")
+appendLine(reportLines, "---------------")
+if candidateHosts.len == 0 then
+  appendLine(reportLines, "None")
+else
+  hostPreviewIndex = 1
+  for hostRecord in candidateHosts
+    appendLine(reportLines, hostPreviewIndex + ". " + hostRecord.ip + " | " + hostRecord.role + " | priority=" + hostRecord.priority + " | score=" + hostRecord.score + " | " + formatOpenPorts(hostRecord.open_ports))
+    hostPreviewIndex = hostPreviewIndex + 1
+  end for
+end if
+appendLine(reportLines, "")
+
+appendLine(reportLines, "Planned target order")
+appendLine(reportLines, "--------------------")
+if targets.len == 0 then
+  appendLine(reportLines, "None")
+else
+  targetPreviewIndex = 1
+  for target in targets
+    appendLine(reportLines, targetPreviewIndex + ". " + target.ip + ":" + target.port + " [" + target.label + "] -> " + serviceName(target.port))
+    targetPreviewIndex = targetPreviewIndex + 1
+  end for
+end if
+appendLine(reportLines, "")
+
+appendLine(reportLines, "Next phases")
+appendLine(reportLines, "-----------")
+appendLine(reportLines, "Phase 2 will add credential/intel engine.")
+appendLine(reportLines, "Phase 3 will add exploit/access engine.")
+appendLine(reportLines, "Phase 4 will add root bootstrap, router handoff, and final shell/FileExplorer success gating.")
+
+saveResult = saveDiscoveryOutputs(computer, outputDir, reportLines, candidateHosts, targets)
+if saveResult isa string then exit("Failed to save CRS discovery output: " + saveResult)
+
+if not quietMode then
+  print("CRS report saved to " + saveResult.report_path)
+  print("CRS hosts saved to " + saveResult.hosts_path)
+  print("CRS targets saved to " + saveResult.targets_path)
+  print("Build: " + SCRIPT_BUILD)
+  print("Host candidates: " + candidateHosts.len)
+  print("Planned targets: " + targets.len)
+  if targetDiscoveryNote != "" then print("Discovery note: " + targetDiscoveryNote)
+  if targetSelectionNote != "" then print("Selection note: " + targetSelectionNote)
+end if

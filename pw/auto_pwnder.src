@@ -1,0 +1,422 @@
+// ==========================================================
+// AUTO-PWNER v5.3.1 (Hybrid LPE Production Build)
+// ==========================================================
+
+
+// ------------------------------
+// Dependencies
+// ------------------------------
+
+metaxploit = include_lib("/lib/metaxploit.so")
+if not metaxploit then
+    metaxploit = include_lib(current_path + "/metaxploit.so")
+end if
+
+crypto = include_lib("/lib/crypto.so")
+if not crypto then
+    crypto = include_lib(current_path + "/crypto.so")
+end if
+
+if not metaxploit or not crypto then
+    exit("Error: Critical libraries missing.")
+end if
+
+
+// ------------------------------
+// Local context
+// ------------------------------
+
+local_shell = get_shell
+if not local_shell then exit("Error: No local shell.")
+
+local_computer = local_shell.host_computer
+if not local_computer then exit("Error: No local computer.")
+
+local_home = home_dir()
+
+
+// ------------------------------
+// Helpers
+// ------------------------------
+
+trim_ws = function(s)
+    if s == null then return ""
+    while s.len > 0 and (s[0] == " " or s[0] == "\t" or s[0] == "\r")
+        s = s[1:]
+    end while
+    while s.len > 0 and (s[s.len - 1] == " " or s[s.len - 1] == "\t" or s[s.len - 1] == "\r")
+        s = s[:s.len - 1]
+    end while
+    return s
+end function
+
+add_unique = function(lst, value)
+    value = trim_ws(value)
+    if value == "" then return
+    for item in lst
+        if item == value then return
+    end for
+    lst.push(value)
+end function
+
+ensure_local_folder = function(parent_path, folder_name)
+    full_path = parent_path + "/" + folder_name
+    f = local_computer.File(full_path)
+    if f then return full_path
+
+    res = local_computer.create_folder(parent_path, folder_name)
+    if res and res != true and res != 1 then
+        print("[!] create_folder: " + res)
+        return null
+    end if
+
+    f = local_computer.File(full_path)
+    if not f then return null
+    return full_path
+end function
+
+prepare_loot_path = function(target_ip)
+    root_path = ensure_local_folder(local_home, "pwner_loot")
+    if not root_path then return null
+
+    target_folder = "loot_" + target_ip.replace(".", "_")
+    target_path = ensure_local_folder(root_path, target_folder)
+    return target_path
+end function
+
+extract_candidates = function(scan_text)
+    candidates = []
+
+    // Pass 1: HTML-style bold tokens
+    parts = scan_text.split("<b>")
+    if parts.len > 1 then
+        for p in parts[1:]
+            tp = p.split("</b>")
+            if tp.len > 0 then
+                token = tp[0].replace("\n", "").replace("\r", "")
+                add_unique(candidates, token)
+            end if
+        end for
+    end if
+
+    // Pass 2: raw text fallback
+    if candidates.len == 0 then
+        lines = scan_text.split(char(10))
+        for line in lines
+            low = line.lower
+            if low.indexOf("unchecked") != null then
+                cleaned = line.replace("<b>", "")
+                cleaned = cleaned.replace("</b>", "")
+                cleaned = cleaned.replace("\r", "")
+                add_unique(candidates, cleaned)
+            end if
+        end for
+    end if
+
+    return candidates
+end function
+
+scrub_logs = function(rem_shell)
+    comp = rem_shell.host_computer
+    log_file = comp.File("/var/system.log")
+    if not log_file then return
+
+    if not log_file.has_permission("w") then
+        print("[-] Cleanup skipped: no write permission on /var/system.log")
+        return
+    end if
+
+    my_ip = local_computer.public_ip
+    lines = log_file.get_content.split(char(10))
+    kept = []
+
+    for line in lines
+        low = line.lower
+        is_target_entry = low.indexOf(my_ip) != null and (
+            low.indexOf("shell obtained") != null or
+            low.indexOf("file deleted") != null
+        )
+
+        if not is_target_entry then
+            kept.push(line)
+        end if
+    end for
+
+    write_res = log_file.set_content(kept.join(char(10)))
+    if typeof(write_res) == "string" and write_res != "" then
+        print("[-] Cleanup write failed: " + write_res)
+    else
+        print("[+] Logs scrubbed.")
+    end if
+end function
+
+get_creds = function(rem_shell)
+    comp = rem_shell.host_computer
+    passwd_file = comp.File("/etc/passwd")
+    if not passwd_file then
+        print("[-] /etc/passwd not found.")
+        return
+    end if
+
+    if not passwd_file.has_permission("r") then
+        print("[-] Cannot read /etc/passwd (permission denied).")
+        return
+    end if
+
+    lines = passwd_file.get_content.split(char(10))
+    for line in lines
+        if line.len < 3 then continue
+
+        parts = line.split(":")
+        if parts.len < 2 then continue
+
+        user = parts[0]
+        enc = parts[1]
+        if enc == "" then continue
+
+        plain = crypto.decipher(enc)
+        if plain then
+            print("[CREDS] " + user + " -> " + plain)
+        else
+            print("[CREDS] " + user + " -> <undeciphered>")
+        end if
+    end for
+end function
+
+exfil_folder = function(rem_shell, path, dest_path)
+    comp = rem_shell.host_computer
+    folder = comp.File(path)
+    if not folder then return
+    if not folder.has_permission("r") then return
+    if not folder.is_folder then return
+
+    files = folder.get_files
+    for f in files
+        if f.is_binary then continue
+
+        low_name = f.name.lower
+        should_take = (
+            low_name.indexOf("pass")   != null or
+            low_name.indexOf("bank")   != null or
+            low_name.indexOf("secret") != null or
+            low_name.indexOf("wallet") != null or
+            low_name.indexOf("mail")   != null or
+            low_name.indexOf("conf")   != null
+        )
+
+        if should_take then
+            print("[*] Exfiltrating: " + f.path)
+            xfer = rem_shell.scp(f.path, dest_path, local_shell)
+            if xfer != 1 and xfer != true then
+                if xfer then
+                    print("[-] SCP failed: " + xfer)
+                else
+                    print("[-] SCP failed.")
+                end if
+            end if
+        end if
+    end for
+
+    subdirs = folder.get_folders
+    for sub in subdirs
+        exfil_folder(rem_shell, sub.path, dest_path)
+    end for
+end function
+
+
+// ------------------------------
+// Inputs
+// ------------------------------
+
+target_ip = user_input("Target IP: ")
+if not is_valid_ip(target_ip) then
+    exit("Error: Invalid IP format.")
+end if
+
+port_raw = user_input("Target Port: ")
+target_port = port_raw.to_int
+if typeof(target_port) != "number" then
+    exit("Error: Invalid port.")
+end if
+if target_port < 1 or target_port > 65535 then
+    exit("Error: Port out of range.")
+end if
+
+loot_path = prepare_loot_path(target_ip)
+if not loot_path then
+    exit("Error: Could not prepare local loot folder.")
+end if
+
+
+// ------------------------------
+// Main exploit flow
+// ------------------------------
+
+print("[1/6] Opening net session...")
+session = metaxploit.net_use(target_ip, target_port)
+if not session then
+    exit("Error: net_use failed.")
+end if
+
+print("[2/6] Dumping remote library...")
+lib = session.dump_lib()
+if not lib then
+    exit("Error: dump_lib failed.")
+end if
+
+print("[3/6] Scanning memory zones...")
+mem_zones = metaxploit.scan(lib)
+if typeof(mem_zones) == "string" then
+    exit("Scan error: " + mem_zones)
+end if
+if not mem_zones or mem_zones.len == 0 then
+    exit("No vulnerable memory zones found.")
+end if
+
+print("[4/6] Testing exploit candidates...")
+for addr in mem_zones
+    scan_text = metaxploit.scan_address(lib, addr)
+    if typeof(scan_text) != "string" then continue
+
+    candidates = extract_candidates(scan_text)
+    if candidates.len == 0 then continue
+
+    for candidate in candidates
+        print("[*] Trying " + candidate + " @ " + addr)
+        result = lib.overflow(addr, candidate)
+
+        if not result then continue
+        if typeof(result) != "shell" then continue
+
+        print("[+] ACCESS GRANTED")
+        print("[+] Candidate: " + candidate)
+        print("[+] Memory zone: " + addr)
+
+        // ------------------------------------------
+        // Root probe + hybrid LPE delivery
+        // ------------------------------------------
+
+        ipc = get_custom_object()
+        ipc.lpe_status = "none"
+
+        status_path = "/tmp/lpe.status"
+        old_status = result.host_computer.File(status_path)
+        if old_status and old_status.has_permission("w") then
+            old_status.delete
+        end if
+
+        probe_name = "prb_" + floor(rnd * 1000)
+        probe_res = result.host_computer.create_user(probe_name, "p123")
+
+        already_root = false
+        lpe_status = "none"
+
+        if probe_res == true or probe_res == 1 then
+            already_root = true
+            lpe_status = "root"
+            print("[+] Already root. Cleaning probe...")
+
+            del_probe = result.host_computer.delete_user(probe_name, true)
+            if del_probe != true and del_probe != 1 then
+                if del_probe then print("[-] Probe cleanup warning: " + del_probe)
+            end if
+        else
+            print("[-] Limited shell. Delivering LPE worker...")
+
+            lpe_bin = local_home + "/lpe"
+            lpe_file = local_computer.File(lpe_bin)
+            if not lpe_file then
+                print("[-] Missing local LPE binary at " + lpe_bin)
+            else
+                upload = local_shell.scp(lpe_bin, "/tmp", result)
+                if upload == true or upload == 1 then
+                    result.launch("/tmp/lpe", "")
+
+                    timeout = 0
+                    final_status = "unknown"
+
+                    while timeout < 20
+                        // Check 1: IPC
+                        if ipc.lpe_status == "success" or ipc.lpe_status == "failed" or ipc.lpe_status == "partial" then
+                            final_status = ipc.lpe_status
+                            break
+                        end if
+
+                        // Check 2: filesystem fallback
+                        sf = result.host_computer.File(status_path)
+                        if sf and sf.has_permission("r") then
+                            content = trim_ws(sf.get_content)
+                            if content == "success" or content == "failed" or content == "partial" then
+                                final_status = content
+                                break
+                            end if
+                        end if
+
+                        wait(1)
+                        timeout = timeout + 1
+                    end while
+
+                    lpe_status = final_status
+
+                    if final_status == "success" then
+                        print("[+] LPE success.")
+                    else if final_status == "partial" then
+                        print("[*] LPE partial success.")
+                    else
+                        print("[-] LPE failed or timed out.")
+                    end if
+                else
+                    if upload then
+                        print("[-] LPE upload failed: " + upload)
+                    else
+                        print("[-] LPE upload failed.")
+                    end if
+                end if
+            end if
+        end if
+
+        // ------------------------------------------
+        // Post-exploit actions
+        // ------------------------------------------
+
+        print("[5/6] Credential extraction...")
+        get_creds(result)
+
+        if user_input("Run exfiltration on /home? (y/n): ") == "y" then
+            exfil_folder(result, "/home", loot_path)
+        end if
+
+        if user_input("Push auto_pwnder to target /tmp? (y/n): ") == "y" then
+            push_res = local_shell.scp(program_path(), "/tmp", result)
+            if push_res == true or push_res == 1 then
+                print("[+] Worker pushed to /tmp")
+            else if push_res then
+                print("[-] Push failed: " + push_res)
+            else
+                print("[-] Push failed.")
+            end if
+        end if
+
+        if already_root then
+            if user_input("Install persistence user now? (y/n): ") == "y" then
+                create_res = result.host_computer.create_user("sys_backup", "p@ss123")
+                if create_res == true or create_res == 1 then
+                    print("[+] Backdoor user created.")
+                else if create_res then
+                    print("[-] Persistence failed: " + create_res)
+                else
+                    print("[-] Persistence failed.")
+                end if
+            end if
+        else if lpe_status == "success" then
+            print("[*] LPE worker already attempted persistence (sys_backup).")
+        end if
+
+        print("[6/6] Cleaning traces...")
+        scrub_logs(result)
+
+        exit("[!] Operation finished.")
+    end for
+end for
+
+exit("No usable shell returned by current scan_address candidates.")

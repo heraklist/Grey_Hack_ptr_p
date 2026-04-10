@@ -1,0 +1,311 @@
+// Grey Hack decipher suite
+// Uses /lib/crypto.so -> decipher(user, hash) on direct text, files, or folders.
+
+NL = char(10)
+TAB = char(9)
+CR = char(13)
+ALNUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+appendLine = function(lines, text)
+  lines.push(text)
+end function
+
+isError = function(value)
+  return value isa string and value != ""
+end function
+
+ensureFolder = function(computer, parentPath, folderName)
+  folderPath = parentPath + "/" + folderName
+  folder = computer.File(folderPath)
+  if folder != null then return folderPath
+
+  created = computer.create_folder(parentPath, folderName)
+  if created == 1 then return folderPath
+
+  return null
+end function
+
+ensureTextFile = function(computer, dirPath, fileName)
+  filePath = dirPath + "/" + fileName
+  file = computer.File(filePath)
+  if file != null then return file
+
+  created = computer.touch(dirPath, fileName)
+  if isError(created) then return null
+
+  return computer.File(filePath)
+end function
+
+normalizeInput = function(value)
+  if value == null then return ""
+  return str(value)
+end function
+
+normalizeText = function(text)
+  if text == null then return ""
+  clean = ""
+  for ch in str(text)
+    if ch != CR then clean = clean + ch
+  end for
+  return clean
+end function
+
+isAlphaNum = function(ch)
+  if ch == null or ch == "" then return 0
+  return ALNUM.indexOf(ch) != null
+end function
+
+isTokenChar = function(ch)
+  if isAlphaNum(ch) then return 1
+  if ch == "_" then return 1
+  if ch == "-" then return 1
+  if ch == "." then return 1
+  if ch == ":" then return 1
+  if ch == "/" then return 1
+  if ch == "@" then return 1
+  return 0
+end function
+
+extractTokens = function(text, minLen = 4)
+  tokens = []
+  current = ""
+
+  for ch in normalizeText(text)
+    if isTokenChar(ch) then
+      current = current + ch
+    else
+      if current.len >= minLen then tokens.push(current)
+      current = ""
+    end if
+  end for
+
+  if current.len >= minLen then tokens.push(current)
+  return tokens
+end function
+
+isLikelyUserName = function(value)
+  userName = normalizeInput(value).trim
+  if userName == "" then return 0
+  if userName.len > 32 then return 0
+  if userName.indexOf(" ") != null then return 0
+  if userName.indexOf("/") != null then return 0
+  if userName.indexOf("@") != null then return 0
+  if userName.indexOf(":") != null then return 0
+  return 1
+end function
+
+inferDecipherUser = function(text, defaultUser = "")
+  normalized = normalizeText(text)
+  parts = normalized.split(":")
+  if parts != null and parts.len > 1 then
+    firstField = normalizeInput(parts[0]).trim
+    if isLikelyUserName(firstField) then return firstField
+  end if
+
+  normalizedDefault = normalizeInput(defaultUser).trim
+  if isLikelyUserName(normalizedDefault) then return normalizedDefault
+  return ""
+end function
+
+registerHit = function(seen, hits, source, decipherUser, rawValue, decipheredValue)
+  key = source + "|" + decipherUser + "|" + rawValue + "|" + decipheredValue
+  if seen[key] != null then return 0
+
+  seen[key] = 1
+  appendLine(hits, "Source: " + source)
+  appendLine(hits, "User: " + decipherUser)
+  appendLine(hits, "Raw: " + rawValue)
+  appendLine(hits, "Deciphered: " + decipheredValue)
+  appendLine(hits, "")
+  return 1
+end function
+
+tryDecipher = function(crypto, seen, hits, source, candidate, decipherUser = "")
+  if candidate == null then return 0
+
+  normalized = normalizeText(candidate)
+  if normalized == "" then return 0
+
+  deciphered = crypto.decipher(normalized)
+  if deciphered == null then return 0
+  if deciphered == "" then return 0
+  if deciphered == normalized then return 0
+
+  return registerHit(seen, hits, source, decipherUser, normalized, deciphered)
+end function
+
+processTextBlock = function(crypto, seen, hits, label, text, defaultUser = "")
+  processed = 0
+  normalized = normalizeText(text)
+
+  if normalized == "" then return processed
+
+  fullUser = inferDecipherUser(normalized, defaultUser)
+  processed += tryDecipher(crypto, seen, hits, label + " [full]", normalized, fullUser)
+
+  lineNumber = 1
+  for line in normalized.split(NL)
+    if line != "" then
+      lineUser = inferDecipherUser(line, defaultUser)
+      processed += tryDecipher(crypto, seen, hits, label + " [line " + lineNumber + "]", line, lineUser)
+
+      for token in extractTokens(line)
+        processed += tryDecipher(crypto, seen, hits, label + " [line " + lineNumber + " token]", token, lineUser)
+      end for
+    end if
+
+    lineNumber += 1
+  end for
+
+  return processed
+end function
+
+processFile = function(crypto, computer, seen, hits, filePath, defaultUser = "")
+  file = computer.File(filePath)
+  if file == null then
+    appendLine(hits, "Missing file: " + filePath)
+    appendLine(hits, "")
+    return 0
+  end if
+
+  if file.is_folder then
+    appendLine(hits, "Skipped folder in file mode: " + file.path)
+    appendLine(hits, "")
+    return 0
+  end if
+
+  if file.is_binary then
+    appendLine(hits, "Skipped binary file: " + file.path)
+    appendLine(hits, "")
+    return 0
+  end if
+
+  if not file.has_permission("r") then
+    appendLine(hits, "Read failed: " + file.path)
+    appendLine(hits, "Reason: missing read permission")
+    appendLine(hits, "")
+    return 0
+  end if
+
+  content = file.get_content
+  return processTextBlock(crypto, seen, hits, file.path, content, defaultUser)
+end function
+
+scanFolder = function(crypto, computer, seen, hits, folder, recursive = 1, defaultUser = "")
+  totalHits = 0
+
+  if folder == null then return 0
+  if not folder.is_folder then return processFile(crypto, computer, seen, hits, folder.path, defaultUser)
+
+  files = folder.get_files
+  if files != null then
+    for child in files
+      if child != null and not child.is_binary then
+        if child.has_permission("r") then
+          content = child.get_content
+          totalHits += processTextBlock(crypto, seen, hits, child.path, content, defaultUser)
+        else
+          appendLine(hits, "Read failed: " + child.path)
+          appendLine(hits, "Reason: missing read permission")
+          appendLine(hits, "")
+        end if
+      end if
+    end for
+  end if
+
+  if not recursive then return totalHits
+
+  folders = folder.get_folders
+  if folders == null then return totalHits
+
+  for childFolder in folders
+    totalHits += scanFolder(crypto, computer, seen, hits, childFolder, recursive, defaultUser)
+  end for
+
+  return totalHits
+end function
+
+crypto = include_lib("/lib/crypto.so")
+if crypto == null then exit("Missing /lib/crypto.so")
+
+shell = get_shell
+if shell == null then exit("Could not access current shell")
+
+computer = shell.host_computer
+if computer == null then exit("Could not access host computer")
+
+mode = user_input("Mode [text/file/folder]: ").lower
+if mode == "" then mode = "text"
+
+target = ""
+recursive = 1
+
+if mode == "text" then
+  target = user_input("Cipher text: ")
+  if target == "" then exit("No cipher text provided")
+else
+  if mode == "file" then
+    target = user_input("File path: ")
+    if target == "" then exit("No file path provided")
+  else
+    if mode == "folder" then
+      target = user_input("Folder path [current]: ")
+      if target == "" then target = current_path
+
+      recursiveInput = user_input("Recursive scan [Y/n]: ").lower
+      if recursiveInput == "n" or recursiveInput == "no" or recursiveInput == "0" then recursive = 0
+    else
+      exit("Invalid mode: " + mode)
+    end if
+  end if
+end if
+
+targetUser = normalizeInput(user_input("Decipher user hint [optional; for labeling/infer only]: ")).trim
+
+reportDir = ensureFolder(computer, home_dir, "loot")
+if reportDir == null then reportDir = home_dir
+
+reportFile = ensureTextFile(computer, reportDir, "decipher_report.txt")
+if reportFile == null then exit("Unable to create decipher report")
+
+reportLines = []
+seenHits = {}
+hitCount = 0
+
+appendLine(reportLines, "Grey Hack Decipher Suite Report")
+appendLine(reportLines, "Date: " + current_date)
+appendLine(reportLines, "User: " + active_user)
+appendLine(reportLines, "Mode: " + mode)
+appendLine(reportLines, "Target: " + target)
+appendLine(reportLines, "Recursive: " + recursive)
+appendLine(reportLines, "User hint: " + targetUser)
+appendLine(reportLines, "")
+
+if mode == "text" then
+  hitCount = processTextBlock(crypto, seenHits, reportLines, "manual input", target, targetUser)
+else
+  if mode == "file" then
+    hitCount = processFile(crypto, computer, seenHits, reportLines, target, targetUser)
+  else
+    folder = computer.File(target)
+    if folder == null then
+      appendLine(reportLines, "Missing folder: " + target)
+      appendLine(reportLines, "")
+    else
+      hitCount = scanFolder(crypto, computer, seenHits, reportLines, folder, recursive, targetUser)
+    end if
+  end if
+end if
+
+if hitCount == 0 then
+  appendLine(reportLines, "No decipher hits found.")
+  appendLine(reportLines, "")
+end if
+
+appendLine(reportLines, "Total hits: " + hitCount)
+
+saveResult = reportFile.set_content(reportLines.join(NL))
+if isError(saveResult) then exit("Failed to save report: " + saveResult)
+
+print("Report saved to " + reportFile.path)
+print("Decipher hits: " + hitCount)

@@ -1,0 +1,1161 @@
+// ============================================================
+//   GREY HACK - GUEST ESCALATION TOOLKIT v2.0
+//   Fixes:
+//   - safe connect_service handling
+//   - correct metaxploit.sniffer usage
+//   - correct scan_address -> overflow flow
+//   - safer credential/report handling
+//
+//   Dependencies:
+//   - /lib/metaxploit.so
+//   - /lib/crypto.so (optional)
+//
+//   Suggested build:
+//   build /home/guest/guest_escalation_toolkit_v2.src /home/guest/
+// ============================================================
+
+NL = char(10)
+CR = char(13)
+TAB = char(9)
+BUILD = "2026-04-07-v2"
+CREDENTIAL_KEYWORDS = ["pass", "passwd", "password", "pwd", "user", "username", "login", "credential", "secret", "token", "auth", "ssh", "ftp", "mail", "bank", "wallet", "card", "pin", "config", "shadow"]
+TOKEN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.:@/$"
+
+appendLine = function(lines, text)
+  lines.push(text)
+end function
+
+isError = function(value)
+  return typeof(value) == "string" and normalizeInput(value).trim != ""
+end function
+
+isApiSuccess = function(value)
+  if value == null then return 0
+  if isError(value) then return 0
+  if value == 0 then return 0
+  return 1
+end function
+
+normalizeInput = function(value, defaultValue = "")
+  if value == null then return defaultValue
+  return str(value)
+end function
+
+normalizeText = function(value, defaultValue = "")
+  clean = ""
+  for ch in normalizeInput(value, defaultValue)
+    if ch != CR then clean = clean + ch
+  end for
+  return clean
+end function
+
+toYesNoFlag = function(inputValue, defaultValue = 1)
+  lowered = normalizeInput(inputValue).trim.lower
+  if lowered == "" then return defaultValue
+  if lowered == "y" or lowered == "yes" or lowered == "1" or lowered == "true" then return 1
+  if lowered == "n" or lowered == "no" or lowered == "0" or lowered == "false" then return 0
+  return defaultValue
+end function
+
+listHasValue = function(items, wanted)
+  if items == null then return 0
+  for item in items
+    if item == wanted then return 1
+  end for
+  return 0
+end function
+
+pushUniqueString = function(values, seen, rawValue)
+  valueText = normalizeInput(rawValue).trim
+  if valueText == "" then return 0
+  if listHasValue(seen, valueText) then return 0
+  seen.push(valueText)
+  values.push(valueText)
+  return 1
+end function
+
+pathBaseName = function(pathValue)
+  pathText = normalizeInput(pathValue)
+  if pathText == "" then return ""
+
+  parts = pathText.split("/")
+  if parts == null or parts.len == 0 then return pathText
+
+  lastPart = parts[parts.len - 1]
+  if lastPart != "" then return lastPart
+  if parts.len > 1 then return parts[parts.len - 2]
+  return pathText
+end function
+
+ensureFolder = function(computer, parentPath, folderName)
+  folderPath = parentPath + "/" + folderName
+  folder = computer.File(folderPath)
+  if folder != null then
+    if not folder.is_folder then return null
+    if not folder.has_permission("w") then return null
+    return folderPath
+  end if
+
+  created = computer.create_folder(parentPath, folderName)
+  if isError(created) then return null
+
+  folder = computer.File(folderPath)
+  if folder == null then return null
+  if not folder.is_folder then return null
+  if not folder.has_permission("w") then return null
+  return folderPath
+end function
+
+ensureTextFile = function(computer, dirPath, fileName)
+  filePath = dirPath + "/" + fileName
+  file = computer.File(filePath)
+  if file != null then
+    if file.is_folder then return null
+    if file.is_binary then return null
+    if not file.has_permission("w") then return null
+    return file
+  end if
+
+  created = computer.touch(dirPath, fileName)
+  if isError(created) then return null
+
+  file = computer.File(filePath)
+  if file == null then return null
+  if file.is_folder then return null
+  if file.is_binary then return null
+  if not file.has_permission("w") then return null
+  return file
+end function
+
+readTextFile = function(file)
+  if file == null then return null
+  if file.is_folder then return null
+  if file.is_binary then return null
+  if not file.has_permission("r") then return null
+  return normalizeText(file.get_content)
+end function
+
+isNumericText = function(textValue)
+  text = normalizeInput(textValue).trim
+  if text == "" then return 0
+
+  for ch in text
+    if ch < "0" or ch > "9" then return 0
+  end for
+
+  return 1
+end function
+
+div = function()
+  line = "------------------------------------------------"
+  print(line)
+  appendLine(report_lines, line)
+end function
+
+log = function(tag, msg)
+  line = "[" + tag + "] " + msg
+  print(line)
+  appendLine(report_lines, line)
+end function
+
+loadPreferredLib = function(fileName)
+  builtInLib = include_lib("/lib/" + fileName)
+  if builtInLib != null then return builtInLib
+
+  externalLib = include_lib(current_path + "/" + fileName)
+  if externalLib != null then return externalLib
+
+  return null
+end function
+
+extractUnsafeValues = function(scanInfo)
+  values = []
+  seen = []
+  remaining = normalizeInput(scanInfo)
+
+  while 1
+    tagStart = remaining.indexOf("<b>")
+    if tagStart == null then break
+
+    remaining = remaining[tagStart + 3:]
+    tagEnd = remaining.indexOf("</b>")
+    if tagEnd == null then break
+
+    candidate = remaining[0:tagEnd]
+    if candidate != "" and not listHasValue(seen, candidate) then
+      seen.push(candidate)
+      values.push(candidate)
+    end if
+
+    if tagEnd + 4 >= remaining.len then break
+    remaining = remaining[tagEnd + 4:]
+  end while
+
+  return values
+end function
+
+runOverflowVariant = function(metaLib, memoryAddress, unsafeValue, extraArg = "")
+  extraText = normalizeInput(extraArg).trim
+  if extraText != "" then return metaLib.overflow(memoryAddress, unsafeValue, extraText)
+  return metaLib.overflow(memoryAddress, unsafeValue)
+end function
+
+accessLevelScore = function(accessLevel)
+  lowered = normalizeInput(accessLevel).trim.lower
+  if lowered == "root" then return 3
+  if lowered == "user" then return 2
+  if lowered == "guest" then return 1
+  return 0
+end function
+
+isSameComputer = function(firstComputer, secondComputer)
+  if firstComputer == null or secondComputer == null then return 0
+
+  firstPublicIp = normalizeInput(firstComputer.public_ip).trim
+  firstLocalIp = normalizeInput(firstComputer.local_ip).trim
+  secondPublicIp = normalizeInput(secondComputer.public_ip).trim
+  secondLocalIp = normalizeInput(secondComputer.local_ip).trim
+
+  if firstPublicIp != "" and secondPublicIp != "" and firstPublicIp != secondPublicIp then return 0
+  if firstLocalIp != "" and secondLocalIp != "" and firstLocalIp != secondLocalIp then return 0
+  if firstLocalIp == "" and secondLocalIp == "" then return 0
+  if firstPublicIp != "" and secondPublicIp != "" then return 1
+  if firstLocalIp != "" and secondLocalIp != "" then return 1
+  return 0
+end function
+
+buildRemoteAddresses = function(sourceShell, remoteComputer, preferredAddress = "")
+  addresses = []
+  seen = []
+
+  pushUniqueString(addresses, seen, preferredAddress)
+
+  if sourceShell != null and remoteComputer != null then
+    currentComputer = sourceShell.host_computer
+    if currentComputer != null then
+      if normalizeInput(currentComputer.public_ip).trim != "" and normalizeInput(currentComputer.public_ip).trim == normalizeInput(remoteComputer.public_ip).trim then
+        pushUniqueString(addresses, seen, remoteComputer.local_ip)
+      end if
+    end if
+  end if
+
+  if remoteComputer != null then
+    pushUniqueString(addresses, seen, remoteComputer.public_ip)
+    pushUniqueString(addresses, seen, remoteComputer.local_ip)
+  end if
+
+  return addresses
+end function
+
+loginAccessType = function(accessObject)
+  lowered = normalizeInput(typeof(accessObject)).trim.lower
+  if lowered == "shell" then return "shell"
+  if lowered.indexOf("ftp") != null then return "ftp"
+  return lowered
+end function
+
+listReadableUserHomes = function(remoteComputer)
+  readableUsers = []
+  if remoteComputer == null then return readableUsers
+
+  homeFolder = remoteComputer.File("/home")
+  if homeFolder == null then return readableUsers
+  if not homeFolder.is_folder then return readableUsers
+  if not homeFolder.has_permission("r") then return readableUsers
+
+  subFolders = homeFolder.get_folders
+  if subFolders == null then return readableUsers
+
+  for subFolder in subFolders
+    if subFolder == null then continue
+    if not subFolder.is_folder then continue
+    if not subFolder.has_permission("r") then continue
+
+    userName = pathBaseName(subFolder.path)
+    if userName == "" then continue
+    if listHasValue(readableUsers, userName) then continue
+    readableUsers.push(userName)
+  end for
+
+  return readableUsers
+end function
+
+classifyAccessLevel = function(remoteComputer, targetUser = "")
+  if remoteComputer == null then return "none"
+
+  shadowFile = remoteComputer.File("/etc/shadow")
+  if shadowFile != null and not shadowFile.is_folder and shadowFile.has_permission("r") then return "root"
+
+  rootFolder = remoteComputer.File("/root")
+  if rootFolder != null and rootFolder.is_folder and rootFolder.has_permission("r") then return "root"
+
+  readableUsers = listReadableUserHomes(remoteComputer)
+  if readableUsers == null or readableUsers.len == 0 then return "guest"
+
+  normalizedTargetUser = normalizeInput(targetUser).trim
+  if normalizedTargetUser != "" and listHasValue(readableUsers, normalizedTargetUser) then return "user"
+
+  for readableUser in readableUsers
+    if normalizeInput(readableUser).trim.lower != "guest" then return "user"
+  end for
+
+  return "guest"
+end function
+
+safeConnectService = function(sourceShell, remoteComputer, portNumber, userName, passwordValue, serviceType = "ssh", preferredAddress = "")
+  if sourceShell == null then return null
+
+  addresses = buildRemoteAddresses(sourceShell, remoteComputer, preferredAddress)
+  for address in addresses
+    if address == "" then continue
+
+    result = null
+    if serviceType == "" then
+      result = sourceShell.connect_service(address, portNumber, userName, passwordValue)
+    else
+      result = sourceShell.connect_service(address, portNumber, userName, passwordValue, serviceType)
+    end if
+
+    if result == null then continue
+    if typeof(result) == "string" then
+      log("AUTH", "Connect error on " + address + ":" + portNumber + " -> " + normalizeInput(result))
+      continue
+    end if
+
+    accessType = loginAccessType(result)
+    if accessType != "shell" and accessType != "ftp" then continue
+
+    if remoteComputer == null then return result
+    if isSameComputer(result.host_computer, remoteComputer) then return result
+  end for
+
+  return null
+end function
+
+isTokenChar = function(ch)
+  if ch == null or ch == "" then return 0
+  return TOKEN_CHARS.indexOf(ch) != null
+end function
+
+extractTokens = function(text, minLen = 4)
+  tokens = []
+  current = ""
+
+  for ch in normalizeText(text)
+    if isTokenChar(ch) then
+      current = current + ch
+    else
+      if current.len >= minLen then tokens.push(current)
+      current = ""
+    end if
+  end for
+
+  if current.len >= minLen then tokens.push(current)
+  return tokens
+end function
+
+containsCredentialKeyword = function(text)
+  lowered = normalizeText(text).lower
+  if lowered == "" then return 0
+
+  for keyword in CREDENTIAL_KEYWORDS
+    if lowered.indexOf(keyword) != null then return 1
+  end for
+
+  return 0
+end function
+
+isLikelyUserName = function(value)
+  userName = normalizeInput(value).trim
+  if userName == "" then return 0
+  if userName.len > 32 then return 0
+  if userName.indexOf(" ") != null then return 0
+  if userName.indexOf("/") != null then return 0
+  if userName.indexOf("@") != null then return 0
+  if userName.indexOf(":") != null then return 0
+  return 1
+end function
+
+inferUserFromPath = function(pathValue)
+  pathText = normalizeInput(pathValue).trim
+  if pathText.indexOf("/home/") != 0 then return ""
+
+  parts = pathText.split("/")
+  if parts == null or parts.len < 3 then return ""
+  return normalizeInput(parts[2]).trim
+end function
+
+inferUserFromLine = function(source, lineText, defaultUser = "")
+  normalizedLine = normalizeText(lineText)
+  sourceLower = normalizeInput(source).lower
+
+  parts = normalizedLine.split(":")
+  if parts != null and parts.len > 1 then
+    firstField = normalizeInput(parts[0]).trim
+    if isLikelyUserName(firstField) then
+      if sourceLower.indexOf("passwd") != null or sourceLower.indexOf("shadow") != null then return firstField
+      if defaultUser != "" and firstField.lower == defaultUser.lower then return firstField
+    end if
+  end if
+
+  normalizedDefault = normalizeInput(defaultUser).trim
+  if isLikelyUserName(normalizedDefault) then return normalizedDefault
+  return ""
+end function
+
+stripNoise = function(value)
+  clean = normalizeInput(value).trim
+  if clean == "" then return ""
+
+  while clean.len > 0
+    firstChar = clean[0]
+    if firstChar == char(34) or firstChar == char(39) or firstChar == "[" or firstChar == "(" then
+      clean = clean[1:]
+    else
+      break
+    end if
+  end while
+
+  while clean.len > 0
+    lastChar = clean[clean.len - 1]
+    if lastChar == char(34) or lastChar == char(39) or lastChar == "," or lastChar == ";" or lastChar == "]" or lastChar == ")" then
+      clean = clean[0:clean.len - 1]
+    else
+      break
+    end if
+  end while
+
+  return clean.trim
+end function
+
+recordPasswordCandidate = function(passwordValue, source)
+  candidate = stripNoise(normalizeText(passwordValue))
+  if candidate == "" then return 0
+  if candidate.len < 3 then return 0
+  if candidate.len > 64 then return 0
+  if listHasValue(password_candidates_seen, candidate) then return 0
+
+  password_candidates_seen.push(candidate)
+  password_candidates.push(candidate)
+  log("PASS", "Candidate password: " + candidate + " [" + source + "]")
+  return 1
+end function
+
+recordCredential = function(userName, passwordValue, source)
+  userText = normalizeInput(userName).trim
+  if userText == "" then userText = "?"
+
+  passText = stripNoise(normalizeText(passwordValue))
+  if passText == "" then return 0
+  if passText == "*" or passText == "!" then return 0
+
+  credentialKey = userText + TAB + passText + TAB + normalizeInput(source).trim
+  if listHasValue(credential_keys, credentialKey) then return 0
+
+  credential_keys.push(credentialKey)
+  credential_entries.push({
+    "user": userText,
+    "pass": passText,
+    "source": normalizeInput(source).trim,
+  })
+  recordPasswordCandidate(passText, source)
+  log("CREDS", userText + ":" + passText + " [" + source + "]")
+  return 1
+end function
+
+tryDecipherValue = function(rawValue, source, userHint = "")
+  if crypto == null then return 0
+
+  normalized = stripNoise(normalizeText(rawValue))
+  if normalized == "" then return 0
+  if normalized.len < 3 then return 0
+
+  deciphered = crypto.decipher(normalized)
+  if deciphered == null then return 0
+
+  decipheredText = stripNoise(normalizeText(deciphered))
+  if decipheredText == "" then return 0
+  if decipheredText == normalized then return 0
+
+  if userHint != "" then
+    return recordCredential(userHint, decipheredText, source + " [decipher]")
+  end if
+
+  return recordPasswordCandidate(decipheredText, source + " [decipher]")
+end function
+
+extractPlainCredentialFromLine = function(lineText, source, defaultUser = "")
+  normalized = normalizeText(lineText).trim
+  if normalized == "" then return 0
+  if not containsCredentialKeyword(normalized) then return 0
+
+  separatorIndex = normalized.indexOf("=")
+  if separatorIndex == null then separatorIndex = normalized.indexOf(":")
+  if separatorIndex == null then return 0
+  if separatorIndex + 1 >= normalized.len then return 0
+
+  candidate = stripNoise(normalized[separatorIndex + 1:])
+  if candidate == "" then return 0
+  if candidate.len < 3 or candidate.len > 64 then return 0
+  if candidate == "*" or candidate == "!" then return 0
+
+  userHint = inferUserFromLine(source, normalized, defaultUser)
+  if userHint != "" then return recordCredential(userHint, candidate, source + " [plain]")
+  return recordPasswordCandidate(candidate, source + " [plain]")
+end function
+
+processTextBlock = function(source, text, defaultUser = "")
+  processed = 0
+  normalized = normalizeText(text)
+  if normalized == "" then return processed
+
+  processed = processed + tryDecipherValue(normalized, source + " [full]", inferUserFromLine(source, normalized, defaultUser))
+
+  lineNumber = 1
+  for line in normalized.split(NL)
+    cleanLine = normalizeInput(line).trim
+    if cleanLine == "" then
+      lineNumber = lineNumber + 1
+      continue
+    end if
+
+    lineSource = source + " [line " + lineNumber + "]"
+    lineUser = inferUserFromLine(source, cleanLine, defaultUser)
+    processed = processed + extractPlainCredentialFromLine(cleanLine, lineSource, defaultUser)
+    processed = processed + tryDecipherValue(cleanLine, lineSource, lineUser)
+
+    for token in extractTokens(cleanLine)
+      processed = processed + tryDecipherValue(token, lineSource + " [token]", lineUser)
+    end for
+
+    lineNumber = lineNumber + 1
+  end for
+
+  return processed
+end function
+
+collectPreviewLines = function(text, maxLines = 5)
+  preview = []
+  if text == null then return preview
+
+  count = 0
+  for line in normalizeText(text).split(NL)
+    cleanLine = normalizeInput(line).trim
+    if cleanLine == "" then continue
+    preview.push(cleanLine)
+    count = count + 1
+    if count >= maxLines then break
+  end for
+
+  return preview
+end function
+
+addDiscoveredUser = function(userName, source = "")
+  if pushUniqueString(discovered_users, discovered_users_seen, userName) then
+    if source == "" then
+      log("USER", "Discovered user: " + normalizeInput(userName).trim)
+    else
+      log("USER", "Discovered user: " + normalizeInput(userName).trim + " [" + source + "]")
+    end if
+    return 1
+  end if
+
+  return 0
+end function
+
+readPasswd = function(targetComputer)
+  div
+  log("PASSWD", "Reading /etc/passwd...")
+
+  passwdFile = targetComputer.File("/etc/passwd")
+  content = readTextFile(passwdFile)
+  if content == null or content == "" then
+    log("PASSWD", "Could not read /etc/passwd.")
+    return []
+  end if
+
+  users = []
+  seen = []
+  for line in content.split(NL)
+    cleanLine = normalizeInput(line).trim
+    if cleanLine == "" then continue
+
+    parts = cleanLine.split(":")
+    if parts == null or parts.len == 0 then continue
+
+    userName = normalizeInput(parts[0]).trim
+    if userName == "" then continue
+    if pushUniqueString(users, seen, userName) then addDiscoveredUser(userName, "/etc/passwd")
+  end for
+
+  log("PASSWD", "Users found: " + users.len)
+  return users
+end function
+
+readReadableHomes = function(targetComputer)
+  div
+  log("HOME", "Inspecting readable home folders...")
+
+  readableUsers = listReadableUserHomes(targetComputer)
+  for userName in readableUsers
+    addDiscoveredUser(userName, "/home")
+  end for
+
+  log("HOME", "Readable home folders: " + readableUsers.len)
+  return readableUsers
+end function
+
+readShadow = function(targetComputer)
+  div
+  log("SHADOW", "Trying /etc/shadow...")
+
+  shadowFile = targetComputer.File("/etc/shadow")
+  if shadowFile == null then
+    log("SHADOW", "/etc/shadow not found.")
+    return 0
+  end if
+
+  if shadowFile.is_folder then
+    log("SHADOW", "/etc/shadow is not a file.")
+    return 0
+  end if
+
+  if not shadowFile.has_permission("r") then
+    log("SHADOW", "Read permission denied. Expected on guest access.")
+    return 0
+  end if
+
+  content = normalizeText(shadowFile.get_content)
+  if content == "" then
+    log("SHADOW", "/etc/shadow is empty or unreadable.")
+    return 0
+  end if
+
+  cracked = 0
+  for line in content.split(NL)
+    cleanLine = normalizeInput(line).trim
+    if cleanLine == "" then continue
+
+    parts = cleanLine.split(":")
+    if parts == null or parts.len < 2 then continue
+
+    userName = normalizeInput(parts[0]).trim
+    hashValue = normalizeInput(parts[1]).trim
+    if userName == "" then continue
+    if hashValue == "" or hashValue == "*" or hashValue == "!" then continue
+
+    addDiscoveredUser(userName, "/etc/shadow")
+    cracked = cracked + tryDecipherValue(hashValue, "/etc/shadow:" + userName, userName)
+  end for
+
+  log("SHADOW", "Decipher hits from shadow: " + cracked)
+  return cracked
+end function
+
+scanFolderForCredentials = function(folder, depth, maxDepth, state)
+  if folder == null then return
+  if not folder.is_folder then return
+  if not folder.has_permission("r") then return
+  if depth > maxDepth then return
+  if state.scanned >= state.max_files then return
+
+  files = folder.get_files
+  if files != null then
+    for file in files
+      if state.scanned >= state.max_files then return
+      if file == null then continue
+      if file.is_binary then continue
+      if not file.has_permission("r") then continue
+
+      state.scanned = state.scanned + 1
+      content = readTextFile(file)
+      if content == null or content == "" then continue
+
+      defaultUser = inferUserFromPath(file.path)
+      interesting = containsCredentialKeyword(file.path) or containsCredentialKeyword(content)
+      if interesting then
+        state.interesting = state.interesting + 1
+        log("SCAN", "Interesting file: " + file.path)
+        for previewLine in collectPreviewLines(content, 5)
+          previewText = "      | " + previewLine
+          print(previewText)
+          appendLine(report_lines, previewText)
+        end for
+      end if
+
+      state.hits = state.hits + processTextBlock(file.path, content, defaultUser)
+    end for
+  end if
+
+  if depth >= maxDepth then return
+
+  subFolders = folder.get_folders
+  if subFolders == null then return
+
+  for subFolder in subFolders
+    if subFolder == null then continue
+    scanFolderForCredentials(subFolder, depth + 1, maxDepth, state)
+    if state.scanned >= state.max_files then return
+  end for
+end function
+
+scanReadableFiles = function(targetComputer)
+  div
+  log("SCAN", "Scanning readable folders for credential hints...")
+
+  state = {
+    "max_files": 80,
+    "scanned": 0,
+    "interesting": 0,
+    "hits": 0,
+  }
+
+  targetFolders = ["/etc", "/home", "/var", "/tmp"]
+  for folderPath in targetFolders
+    folder = targetComputer.File(folderPath)
+    if folder == null then continue
+    scanFolderForCredentials(folder, 0, 2, state)
+    if state.scanned >= state.max_files then break
+  end for
+
+  log("SCAN", "Files scanned: " + state.scanned)
+  log("SCAN", "Interesting files: " + state.interesting)
+  log("SCAN", "Credential hits: " + state.hits)
+  return state
+end function
+
+runSniffer = function()
+  div
+  log("SNIFF", "Starting sniffer...")
+
+  saveSource = toYesNoFlag(user_input("Save encode source if available? (y/N): "), 0)
+  sniffText = meta.sniffer(saveSource)
+  if sniffText == null then
+    log("SNIFF", "Sniffer failed or is unsupported here.")
+    return 0
+  end if
+
+  normalized = normalizeText(sniffText)
+  if normalized == "" then
+    log("SNIFF", "Sniffer returned no data.")
+    return 0
+  end if
+
+  log("SNIFF", "Captured traffic:")
+  print(normalized)
+  appendLine(report_lines, normalized)
+  hits = processTextBlock("sniffer", normalized, "")
+  log("SNIFF", "Credential hits from capture: " + hits)
+  if saveSource then log("SNIFF", "saveEncSource was enabled. Check the environment output for any saved encode source details.")
+  return hits
+end function
+
+gatherAttackPorts = function(targetComputer, preferredPort = 22, extraPortsText = "")
+  ports = []
+  seen = []
+
+  if preferredPort != null then
+    pushUniqueString(ports, seen, "" + preferredPort)
+  end if
+
+  portObjects = null
+  if targetComputer != null then portObjects = targetComputer.get_ports
+  if portObjects != null then
+    for portObject in portObjects
+      if portObject == null then continue
+      if portObject.is_closed then continue
+      pushUniqueString(ports, seen, "" + portObject.port_number)
+    end for
+  end if
+
+  extraText = normalizeInput(extraPortsText).trim
+  if extraText != "" then
+    for part in extraText.split(",")
+      cleanPart = normalizeInput(part).trim
+      if cleanPart != "" then pushUniqueString(ports, seen, cleanPart)
+    end for
+  end if
+
+  result = []
+  for portText in ports
+    if portText == "" then continue
+    if not isNumericText(portText) then continue
+    parsed = portText.val
+    if parsed <= 0 then continue
+    result.push(parsed)
+  end for
+
+  return result
+end function
+
+buildLoginUserCandidates = function()
+  users = []
+  seen = []
+
+  pushUniqueString(users, seen, "root")
+  pushUniqueString(users, seen, "admin")
+
+  for userName in discovered_users
+    lowered = normalizeInput(userName).trim.lower
+    if lowered == "guest" then continue
+    pushUniqueString(users, seen, userName)
+  end for
+
+  pushUniqueString(users, seen, guest_user)
+  return users
+end function
+
+tryKnownCredentials = function(remoteComputer, preferredPort, serviceType = "ssh", preferredAddress = "")
+  div
+  log("LOGIN", "Trying collected credentials for stronger access...")
+
+  if password_candidates == null or password_candidates.len == 0 then
+    log("LOGIN", "No password candidates available.")
+    return null
+  end if
+
+  loginUsers = buildLoginUserCandidates()
+  loginPorts = gatherAttackPorts(remoteComputer, preferredPort, "")
+  if loginPorts == null or loginPorts.len == 0 then loginPorts = [preferredPort, 22]
+
+  attempts = 0
+  for loginPort in loginPorts
+    for userName in loginUsers
+      for passwordValue in password_candidates
+        attempts = attempts + 1
+        if attempts > 120 then
+          log("LOGIN", "Stopping after 120 attempts.")
+          return null
+        end if
+
+        if normalizeInput(userName).trim.lower == normalizeInput(guest_user).trim.lower and passwordValue == guest_pass then continue
+
+        accessObject = safeConnectService(local_shell, remoteComputer, loginPort, userName, passwordValue, serviceType, preferredAddress)
+        if accessObject == null then continue
+
+        accessLevel = classifyAccessLevel(accessObject.host_computer, userName)
+        log("LOGIN", "Success on " + loginPort + " -> " + userName + ":" + passwordValue + " [" + accessLevel + "]")
+        recordCredential(userName, passwordValue, "login-success")
+
+        if normalizeInput(userName).trim.lower != normalizeInput(guest_user).trim.lower then return accessObject
+        if accessLevelScore(accessLevel) > accessLevelScore(best_access_level) then return accessObject
+      end for
+    end for
+  end for
+
+  log("LOGIN", "No stronger shell found with collected credentials.")
+  return null
+end function
+
+tryBootstrapShellFromComputer = function(remoteComputer, preferredPort, serviceType = "ssh", preferredAddress = "")
+  if remoteComputer == null then return null
+
+  log("AUTO", "Computer object obtained. Attempting shell bootstrap...")
+
+  rootChange = remoteComputer.change_password("root", "admin")
+  if isApiSuccess(rootChange) then
+    recordCredential("root", "admin", "computer.change_password")
+    rootShell = safeConnectService(local_shell, remoteComputer, preferredPort, "root", "admin", serviceType, preferredAddress)
+    if rootShell == null and preferredPort != 22 then rootShell = safeConnectService(local_shell, remoteComputer, 22, "root", "admin", serviceType, preferredAddress)
+    if rootShell != null then
+      log("AUTO", "Root shell obtained after password change.")
+      return rootShell
+    end if
+    log("AUTO", "Root password changed, but login failed.")
+  else
+    log("AUTO", "Root password change failed: " + normalizeInput(rootChange))
+  end if
+
+  createAdmin = remoteComputer.create_user("admin", "admin")
+  if isApiSuccess(createAdmin) then
+    recordCredential("admin", "admin", "computer.create_user")
+    adminShell = safeConnectService(local_shell, remoteComputer, preferredPort, "admin", "admin", serviceType, preferredAddress)
+    if adminShell == null and preferredPort != 22 then adminShell = safeConnectService(local_shell, remoteComputer, 22, "admin", "admin", serviceType, preferredAddress)
+    if adminShell != null then
+      log("AUTO", "Admin shell obtained after user creation.")
+      return adminShell
+    end if
+    log("AUTO", "Admin user created, but login failed.")
+  else
+    adminChange = remoteComputer.change_password("admin", "admin")
+    if isApiSuccess(adminChange) then
+      recordCredential("admin", "admin", "computer.change_password")
+      adminShell = safeConnectService(local_shell, remoteComputer, preferredPort, "admin", "admin", serviceType, preferredAddress)
+      if adminShell == null and preferredPort != 22 then adminShell = safeConnectService(local_shell, remoteComputer, 22, "admin", "admin", serviceType, preferredAddress)
+      if adminShell != null then
+        log("AUTO", "Admin shell obtained after password reset.")
+        return adminShell
+      end if
+      log("AUTO", "Admin password changed, but login failed.")
+    end if
+  end if
+
+  return null
+end function
+
+tryLocalExploit = function(targetIp, targetComputer, preferredPort, serviceType = "ssh", extraPortsText = "")
+  div
+  log("LOCAL", "Trying service exploits on target host...")
+
+  attackPorts = gatherAttackPorts(targetComputer, preferredPort, extraPortsText)
+  if attackPorts == null or attackPorts.len == 0 then
+    log("LOCAL", "No open ports available for exploit attempts.")
+    return null
+  end if
+
+  addresses = buildRemoteAddresses(local_shell, targetComputer, targetIp)
+  attempts = 0
+
+  for address in addresses
+    if address == "" then continue
+
+    for portNumber in attackPorts
+      if portNumber == null then continue
+
+      log("LOCAL", "Trying " + address + ":" + portNumber + "...")
+      session = meta.net_use(address, portNumber)
+      if session == null then
+        log("LOCAL", "Session failed on " + address + ":" + portNumber)
+        continue
+      end if
+
+      remoteLib = session.dump_lib
+      if remoteLib == null then
+        log("LOCAL", "Library dump failed on " + address + ":" + portNumber)
+        continue
+      end if
+
+      libName = normalizeInput(remoteLib.lib_name).trim
+      libVersion = normalizeInput(remoteLib.version).trim
+      log("LOCAL", "Library " + libName + " v" + libVersion)
+
+      memories = meta.scan(remoteLib)
+      if memories == null or memories.len == 0 then
+        log("LOCAL", "No vulnerable memory zones on " + address + ":" + portNumber)
+        continue
+      end if
+
+      for memoryAddress in memories
+        scanInfo = meta.scan_address(remoteLib, memoryAddress)
+        unsafeValues = extractUnsafeValues(scanInfo)
+        if unsafeValues == null or unsafeValues.len == 0 then continue
+
+        for unsafeValue in unsafeValues
+          attempts = attempts + 1
+          if attempts > 80 then
+            log("LOCAL", "Stopping exploit attempts after 80 runs.")
+            return null
+          end if
+
+          result = runOverflowVariant(remoteLib, memoryAddress, unsafeValue)
+          if result == null then continue
+
+          resultType = typeof(result)
+          log("LOCAL", "Hit " + memoryAddress + " / " + unsafeValue + " -> " + resultType)
+
+          if resultType == "shell" then
+            log("LOCAL", "Direct shell acquired.")
+            return result
+          end if
+
+          if resultType == "computer" then
+            betterShell = tryBootstrapShellFromComputer(result, preferredPort, serviceType, address)
+            if betterShell != null then return betterShell
+            continue
+          end if
+
+          if resultType == "file" then
+            if result != null then
+              log("LOCAL", "Readable file object: " + normalizeInput(result.path))
+              fileText = readTextFile(result)
+              if fileText != null and fileText != "" then processTextBlock("overflow-file:" + result.path, fileText, inferUserFromPath(result.path))
+            end if
+            continue
+          end if
+
+          if resultType == "string" then
+            resultText = normalizeText(result)
+            if resultText != "" then
+              appendLine(report_lines, resultText)
+              processTextBlock("overflow-string:" + libName + ":" + portNumber, resultText, "")
+            end if
+            continue
+          end if
+        end for
+      end for
+    end for
+  end for
+
+  log("LOCAL", "No better shell found through service exploits.")
+  return null
+end function
+
+saveReport = function()
+  reportDir = ensureFolder(local_comp, home_dir, "loot")
+  if reportDir == null then reportDir = home_dir
+
+  reportFile = ensureTextFile(local_comp, reportDir, "guest_escalation_report_v2.txt")
+  if reportFile == null then
+    log("REPORT", "Could not create report file.")
+    return null
+  end if
+
+  saveResult = reportFile.set_content(report_lines.join(NL))
+  if isError(saveResult) then
+    log("REPORT", "Failed to save report: " + normalizeInput(saveResult))
+    return null
+  end if
+
+  log("REPORT", "Saved report to " + reportFile.path)
+  return reportFile
+end function
+
+// Runtime bootstrap
+
+report_lines = []
+credential_entries = []
+credential_keys = []
+password_candidates = []
+password_candidates_seen = []
+discovered_users = []
+discovered_users_seen = []
+
+local_shell = get_shell
+if local_shell == null then exit("[-] Could not access local shell.")
+
+local_comp = local_shell.host_computer
+if local_comp == null then exit("[-] Could not access local computer.")
+
+meta = loadPreferredLib("metaxploit.so")
+if meta == null then exit("[-] metaxploit.so not found.")
+
+crypto = loadPreferredLib("crypto.so")
+if crypto == null then
+  print("[WARN] crypto.so not found. Decipher features disabled.")
+  appendLine(report_lines, "[WARN] crypto.so not found. Decipher features disabled.")
+end if
+
+print("")
+print("==============================================")
+print("  GUEST ESCALATION TOOLKIT v2.0")
+print("  Sniff | Passwd | Shadow | Scan | Exploit")
+print("==============================================")
+print("")
+
+appendLine(report_lines, "Guest Escalation Toolkit v2.0")
+appendLine(report_lines, "Build: " + BUILD)
+appendLine(report_lines, "Date: " + current_date)
+appendLine(report_lines, "Current user: " + normalizeInput(active_user))
+appendLine(report_lines, "")
+
+target_ip = normalizeInput(user_input("Target IP (host with guest shell): ")).trim
+if target_ip == "" then exit("[-] Missing IP.")
+if not is_valid_ip(target_ip) then exit("[-] Invalid IP.")
+
+guest_user = normalizeInput(user_input("Guest username: ")).trim
+if guest_user == "" then exit("[-] Missing guest username.")
+
+guest_pass = normalizeInput(user_input("Guest password: "))
+guest_port_input = normalizeInput(user_input("Service port [22]: ")).trim
+guest_port = 22
+if guest_port_input != "" and isNumericText(guest_port_input) then guest_port = guest_port_input.val
+if typeof(guest_port) != "number" then guest_port = 22
+
+service_type = normalizeInput(user_input("Service type [ssh]: ")).trim.lower
+if service_type == "" then service_type = "ssh"
+
+div
+log("INFO", "Connecting as " + guest_user + " to " + target_ip + ":" + guest_port + " via " + service_type + "...")
+
+target_shell = local_shell.connect_service(target_ip, guest_port, guest_user, guest_pass, service_type)
+if target_shell == null then exit("[-] Connection failed.")
+if typeof(target_shell) == "string" then exit("[-] Connection error: " + normalizeInput(target_shell))
+if loginAccessType(target_shell) != "shell" then exit("[-] Connection did not return a shell.")
+
+target_comp = target_shell.host_computer
+if target_comp == null then exit("[-] Missing target computer.")
+
+best_shell = target_shell
+best_access_level = classifyAccessLevel(target_comp, guest_user)
+
+log("INFO", "Connected. Initial access level: " + best_access_level)
+appendLine(report_lines, "Target public IP: " + normalizeInput(target_comp.public_ip).trim)
+appendLine(report_lines, "Target local IP: " + normalizeInput(target_comp.local_ip).trim)
+appendLine(report_lines, "Initial access level: " + best_access_level)
+appendLine(report_lines, "")
+
+addDiscoveredUser(guest_user, "input")
+readPasswd(target_comp)
+readReadableHomes(target_comp)
+readShadow(target_comp)
+
+do_sniff = toYesNoFlag(user_input("Run sniffer now? (y/N): "), 0)
+if do_sniff then
+  runSniffer
+end if
+
+if password_candidates.len > 0 then
+  do_reuse = toYesNoFlag(user_input("Try collected credentials now? (Y/n): "), 1)
+  if do_reuse then
+    strongerShell = tryKnownCredentials(target_comp, guest_port, service_type, target_ip)
+    if strongerShell != null then
+      best_shell = strongerShell
+      best_access_level = classifyAccessLevel(strongerShell.host_computer, "")
+    end if
+  end if
+end if
+
+do_scan = toYesNoFlag(user_input("Scan readable files for credentials? (Y/n): "), 1)
+if do_scan then
+  scanReadableFiles(target_comp)
+end if
+
+if password_candidates.len > 0 and best_shell == target_shell then
+  do_reuse_after_scan = toYesNoFlag(user_input("Retry credential login with new hits? (Y/n): "), 1)
+  if do_reuse_after_scan then
+    strongerShell = tryKnownCredentials(target_comp, guest_port, service_type, target_ip)
+    if strongerShell != null then
+      best_shell = strongerShell
+      best_access_level = classifyAccessLevel(strongerShell.host_computer, "")
+    end if
+  end if
+end if
+
+do_local = toYesNoFlag(user_input("Try local service exploits on target? (y/N): "), 0)
+if do_local then
+  extra_ports = normalizeInput(user_input("Extra ports to test (comma separated, optional): ")).trim
+  betterShell = tryLocalExploit(target_ip, target_comp, guest_port, service_type, extra_ports)
+  if betterShell != null then
+    best_shell = betterShell
+    best_access_level = classifyAccessLevel(betterShell.host_computer, "")
+  end if
+end if
+
+div
+if best_shell != null and best_shell != target_shell then
+  log("RESULT", "Better shell acquired. Access level: " + best_access_level)
+else
+  log("RESULT", "No stronger shell acquired. Current level remains: " + best_access_level)
+end if
+
+if credential_entries.len > 0 then
+  log("RESULT", "Credential entries:")
+  for entry in credential_entries
+    log("RESULT", "  " + entry.user + " : " + entry.pass + " [" + entry.source + "]")
+  end for
+end if
+
+saveReport
+
+open_shell = 0
+if best_shell != null and best_shell != target_shell then
+  open_shell = toYesNoFlag(user_input("Open terminal on the better shell? (Y/n): "), 1)
+end if
+
+if open_shell then
+  best_shell.start_terminal
+end if
+
+div
+log("DONE", "Toolkit completed.")
+div
